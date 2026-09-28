@@ -13,6 +13,9 @@ import html
 import random
 import re
 import argparse
+import unicodedata
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 
 try:
@@ -81,7 +84,7 @@ MOTS_EXCLUS = [
     "proxy", "fake", "custom", "réplique", "replica", "goldée", "metal", "métal",
     "recherche", "cherche", "classeur vide", "sleeve", "protège", "pochette", "peluche",
     "figurine", "jeu vidéo", "switch", "3ds", "fan art", "fanart", "mega construx",
-    "lego", "funko",
+    "lego", "funko", "plush", "plushie", "sticker only",
     # autres jeux / cartes de sport
     "nfl", "nba", "panini", "topps", "upper deck", "football", "baseball", "basket",
     "soccer", "one piece", "yu-gi-oh", "yugioh", "lorcana", "magic the gathering",
@@ -94,6 +97,11 @@ PRIX_MAX = 500.0        # au dessus : hors budget
 # Alerte si : produit Pokémon + prix au moins DECOTE_MIN % sous le prix Cardmarket
 # + bénéfice net (après frais Vinted, port et commission) >= BENEF_MIN
 DECOTE_MIN = 30         # % minimum sous le prix Cardmarket
+# Un message Telegram à CHAQUE run : bilan + meilleure affaire trouvée,
+# même si elle n'atteint pas les seuils. Envoyé en mode silencieux
+# (pas de son) pour que seuls les vrais bons plans fassent sonner ton téléphone.
+RESUME_CHAQUE_RUN = True
+RESUME_SILENCIEUX = True
 BENEF_MIN = 3.0         # bénéfice net minimum en €
 
 # Coûts réels d'un achat Vinted (à ajuster si besoin)
@@ -138,7 +146,7 @@ if GEMINI_API_KEY and GEMINI_ACTIF:
     print(f"🤖 Gemini actif : {len(MODELES)} modèles -> {', '.join(MODELES[:6])}"
           + (" ..." if len(MODELES) > 6 else ""))
 else:
-    print("⚠️ GEMINI_API_KEY absente : seule la WATCHLIST déclenchera des alertes.")
+    print("ℹ️ Gemini non utilisé (clé absente ou GEMINI_ACTIF = False).")
 
 # ================= HISTORIQUE =================
 def charger_historique():
@@ -154,29 +162,35 @@ def sauvegarder_historique(ids):
         json.dump(ids[-2000:], f, indent=2)
 
 # ================= TELEGRAM =================
-def envoyer_telegram(message, photo_url=None, lien=None, recherche_cm=None):
+def lien_cardmarket(recherche):
+    return ("https://www.cardmarket.com/fr/Pokemon/Products/Search?searchString="
+            + requests.utils.quote(recherche or ""))
+
+def envoyer_telegram(message, photo_url=None, lien=None, recherche_cm=None, silencieux=False,
+                     lignes_boutons=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Identifiants Telegram manquants.")
         return False
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     boutons = []
     if lien:
-        boutons.append({"text": "🛒 Vinted", "url": lien})
+        boutons.append({"text": "🛒 Voir sur Vinted", "url": lien})
     if recherche_cm:
-        boutons.append({"text": "📊 Cardmarket", "url":
-                        "https://www.cardmarket.com/fr/Pokemon/Products/Search?searchString="
-                        + requests.utils.quote(recherche_cm)})
-    clavier = {"inline_keyboard": [boutons]} if boutons else None
+        boutons.append({"text": "📊 Cardmarket", "url": lien_cardmarket(recherche_cm)})
+    rangees = ([boutons] if boutons else []) + (lignes_boutons or [])
+    clavier = {"inline_keyboard": rangees} if rangees else None
 
     def post(methode, payload):
         if clavier:
             payload["reply_markup"] = clavier
+        if silencieux:
+            payload["disable_notification"] = True
         return requests.post(f"{base}/{methode}", json=payload, timeout=TIMEOUT)
 
     try:
-        if photo_url:
+        if photo_url and len(message) <= 1024:
             r = post("sendPhoto", {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url,
-                                   "caption": message[:1024], "parse_mode": "HTML"})
+                                   "caption": message, "parse_mode": "HTML"})
             if r.status_code == 200:
                 return True
             print(f"   ⚠️ sendPhoto échoué ({r.status_code}), envoi en texte.")
@@ -492,6 +506,68 @@ def prix_cardmarket(noms, numero, total, reverse=False):
                             "id": carte.get("id")}
     return None
 
+# ================= PRIX CARDMARKET DES PRODUITS SCELLÉS =================
+# Guide de prix officiel publié chaque jour par Cardmarket (gratuit, sans clé)
+CM_CATALOGUE = "https://downloads.s3.cardmarket.com/productCatalog"
+MOTS_SCELLES = re.compile(r"\b(etb|elite trainer|display|booster box|booster bundle|bundle|"
+                          r"coffret|collection|upc|tin|pok[eé]ball tin|blister|tripack|"
+                          r"tri-pack|booster|scell[ée]|sealed|premium|box)\b", re.I)
+ABREVIATIONS = [
+    (r"\betb\b", "elite trainer box"), (r"\bdisplay\b", "booster box"),
+    (r"\bupc\b", "ultra premium collection"), (r"\btri-?pack\b", "3 pack blister"),
+    (r"\bcoffret dresseur d'?elite\b", "elite trainer box"),
+]
+MOTS_VIDES_EN = {"pokemon", "tcg", "scelle", "sealed", "neuf", "new", "fr", "en", "eng",
+                 "francais", "anglais", "english", "french", "the", "de", "la", "le", "et",
+                 "a", "vendre", "pour", "avec", "of", "and", "edition", "version", "set"}
+_catalogue_scelle = None
+
+def jetons(texte):
+    t = unicodedata.normalize("NFKD", texte.lower()).encode("ascii", "ignore").decode()
+    for motif, remplacement in ABREVIATIONS:
+        t = re.sub(motif, remplacement, t)
+    return [w for w in re.findall(r"[a-z0-9]+", t) if w not in MOTS_VIDES_EN]
+
+def charger_catalogue_scelle():
+    global _catalogue_scelle
+    if _catalogue_scelle is not None:
+        return _catalogue_scelle
+    _catalogue_scelle = []
+    try:
+        prods = requests.get(f"{CM_CATALOGUE}/productList/products_nonsingles_6.json",
+                             timeout=(5, 60)).json().get("products", [])
+        guide = requests.get(f"{CM_CATALOGUE}/priceGuide/price_guide_6.json",
+                             timeout=(5, 90)).json().get("priceGuides", [])
+        prix = {g.get("idProduct"): g for g in guide}
+        for pr in prods:
+            g = prix.get(pr.get("idProduct"))
+            ref = g and (g.get("trend") or g.get("avg30") or g.get("avg"))
+            if ref and pr.get("name"):
+                _catalogue_scelle.append((set(jetons(pr["name"])), pr["name"], float(ref)))
+        print(f"   📦 Guide de prix Cardmarket chargé : {len(_catalogue_scelle)} produits scellés")
+    except Exception as e:
+        print(f"   ⚠️ Guide de prix Cardmarket indisponible : {str(e)[:80]}")
+    return _catalogue_scelle
+
+def prix_scelle(requete):
+    """Trouve le produit scellé Cardmarket le plus proche de la requête."""
+    q = set(jetons(requete or ""))
+    if len(q) < 2:
+        return None
+    meilleur, meilleur_score = None, 0
+    for toks, nom, ref in charger_catalogue_scelle():
+        communs = len(q & toks)
+        if communs < 2 or communs / len(q) < 0.75:
+            continue
+        if "case" in toks and "case" not in q:
+            continue  # "Booster Box Case" = plusieurs boîtes
+        score = communs / len(q) - 0.04 * len(toks - q)
+        if score > meilleur_score:
+            meilleur, meilleur_score = (nom, ref), score
+    if meilleur:
+        return {"prix": round(meilleur[1], 2), "nom": meilleur[0], "set": ""}
+    return None
+
 def calcul_rentabilite(prix, prix_revente):
     cout = prix + PROTECTION_FIXE + prix * PROTECTION_PCT + LIVRAISON
     net_revente = prix_revente * (1 - FRAIS_REVENTE_PCT)
@@ -598,24 +674,75 @@ def analyser(a):
     return None, False
 
 # ================= MESSAGE =================
+SEP = "━━━━━━━━━━━━━━━"
+
+def euros(x):
+    return f"{x:,.2f}".replace(",", " ").replace(".", ",").replace(",00", "") + " €"
+
+def jauge(decote):
+    """Barre visuelle de la décote : 10 cases = 100 %."""
+    pleines = max(0, min(10, round(decote / 10)))
+    couleur = "🟩" if decote >= DECOTE_MIN else ("🟨" if decote >= 10 else "🟥")
+    return couleur * pleines + "⬜" * (10 - pleines)
+
+def niveau(decote, benef):
+    if decote >= 50 and benef >= 20:
+        return "💎 PÉPITE"
+    if decote >= 40:
+        return "🚀 GROS COUP"
+    return "🔥 BON PLAN"
+
 def formater(a, titre, infos=None):
+    """Alerte bon plan."""
     e = html.escape
-    lignes = [f"<b>🔥 {titre}</b>", "",
-              f"📦 <b>{e(a['title'])}</b>",
-              f"💰 Prix Vinted : <b>{a['price']:.2f} €</b>"]
+    lignes = [f"<b>{titre}</b>", SEP, f"📦 <b>{e(a['title'][:90])}</b>"]
     if infos:
-        lignes.append(f"📊 {infos['source']} : <b>{infos['ref']:.2f} €</b>"
-                      + (f" ({e(infos['carte'])})" if infos.get("carte") else ""))
-        lignes.append(f"📉 <b>-{infos['decote']} %</b> sous le prix du marché")
-        lignes.append(f"🧾 Coût total (protection + port) : {infos['cout']} €")
-        lignes.append(f"💵 <b>Bénéfice net estimé : +{infos['benef']} € (ROI {infos['roi']} %)</b>")
-        if infos.get("raison"):
-            lignes.append(f"💡 {e(str(infos['raison']))}")
-    if a.get("status"):
-        lignes.append(f"🏷️ État : {e(a['status'])}")
-    if a.get("vendeur"):
-        lignes.append(f"👤 {e(a['vendeur'])}")
-    lignes.append("⚠️ Vérifie le prix sur Cardmarket avant d'acheter.")
+        lignes += [
+            f"💰 Vinted <b>{euros(a['price'])}</b>  ➜  📊 Cardmarket <b>{euros(infos['ref'])}</b>",
+            f"{jauge(infos['decote'])} <b>{'-' if infos['decote'] >= 0 else '+'}{abs(infos['decote'])} %</b>",
+            f"💵 <b>Bénéfice net : {'+' if infos['benef'] >= 0 else ''}{euros(infos['benef'])}</b>"
+            f"  (ROI {infos['roi']} %)",
+            f"🧾 Coût réel (protection + port) : {euros(infos['cout'])}",
+        ]
+        if infos.get("carte"):
+            lignes.append(f"🃏 {e(str(infos['carte'])[:80])}")
+        if infos.get("source", "").startswith("Estimation"):
+            lignes.append("🤖 Prix estimé par l'IA (produit introuvable sur Cardmarket)")
+    details = " · ".join(x for x in [
+        f"🏷️ {e(a['status'])}" if a.get("status") else "",
+        f"👤 {e(a['vendeur'])}" if a.get("vendeur") else ""] if x)
+    if details:
+        lignes.append(details)
+    lignes += [SEP, "⚡ Vérifie Cardmarket en 1 clic et fonce 👇"]
+    return "\n".join(lignes)
+
+def formater_bilan(stats, top):
+    """Bilan d'un passage sans bon plan : stats + podium des meilleures affaires."""
+    e = html.escape
+    heure = datetime.now(ZoneInfo("Europe/Paris")).strftime("%H:%M")
+    lignes = [f"📋 <b>PASSAGE DE {heure}</b> · pas de bon plan", 
+              f"🆕 {stats['nouvelles']} nouvelles · 📊 {stats['comparees']} comparées"
+              f" · 🚫 {stats['ecartees']} écartées"
+              + (f" · ⏳ {stats['attente']} en attente" if stats['attente'] else "")]
+    if top:
+        lignes += [SEP, "🏆 <b>TOP DU PASSAGE</b>"]
+        for medaille, (a, inf) in zip(["🥇", "🥈", "🥉"], top):
+            signe = "-" if inf["decote"] >= 0 else "+"
+            b = f"{'+' if inf['benef'] >= 0 else ''}{euros(inf['benef'])}"
+            lignes.append(f"{medaille} <b>{e(a['title'][:45])}</b>")
+            lignes.append(f"      {euros(a['price'])} vs {euros(inf['ref'])} CM · "
+                          f"{signe}{abs(inf['decote'])} % · {b}")
+        a, inf = top[0]
+        manque = []
+        if inf["decote"] < DECOTE_MIN:
+            manque.append(f"{DECOTE_MIN - inf['decote']} pts de décote")
+        if inf["benef"] < BENEF_MIN:
+            manque.append(f"{euros(BENEF_MIN - inf['benef'])} de bénéfice")
+        if manque:
+            lignes.append(f"📏 Il manque {' et '.join(manque)} au 🥇 pour une alerte")
+    else:
+        lignes += [SEP, "😴 Aucune annonce comparable ce coup-ci."]
+    lignes += [SEP, f"🎯 Tes seuils : -{DECOTE_MIN} % et +{euros(BENEF_MIN)} de bénéfice"]
     return "\n".join(lignes)
 
 # ================= CYCLE =================
@@ -631,11 +758,17 @@ def cycle():
     if premier_lancement and nouvelles:
         # Évite d'envoyer 100 alertes au tout premier lancement
         print("ℹ️ Premier lancement : annonces mémorisées sans alerte.")
+        if RESUME_CHAQUE_RUN:
+            envoyer_telegram(f"🤖 <b>ZuntyTCG-Bot démarré</b>\n{len(nouvelles)} annonces mémorisées. "
+                             "Les alertes arrivent dès le prochain passage.", silencieux=RESUME_SILENCIEUX)
         sauvegarder_historique([a["id"] for a in nouvelles])
         return
 
     alertes = 0
     a_reessayer = 0
+    ecartees = 0
+    comparees = 0
+    candidats = []  # (annonce, infos) de toutes les annonces comparées
     ia_en_panne = False
     ia_dispo = bool(client or GROQ_MODELES)
     for a in nouvelles:
@@ -664,6 +797,12 @@ def cycle():
             if cm:
                 print("   ⚡ Trouvée sur Cardmarket sans IA")
 
+        # 1 bis) Produit scellé en anglais -> guide de prix Cardmarket, SANS IA
+        if not cm and not est_gradee and MOTS_SCELLES.search(a["title"]):
+            cm = prix_scelle(a["title"])
+            if cm:
+                print(f"   ⚡ Trouvé dans le guide Cardmarket sans IA : {cm['nom']}")
+
         # 2) Sinon : IA pour identifier (Pokémon ? faux ? quelle carte ? quel prix ?)
         if not cm and ia_dispo and not ia_en_panne:
             r, ok = analyser(a)
@@ -674,6 +813,7 @@ def cycle():
                 print("   💤 IA indisponible : les annonces sans numéro attendront le prochain run")
             elif res.get("faux") or res.get("suspect") or res.get("pokemon") is False:
                 print(f"   🚫 écartée : {res.get('raison', '')}")
+                ecartees += 1
                 ids.append(a["id"])
                 continue
             elif res.get("numero") and not est_gradee and res.get("type") not in ("gradee", "scelle"):
@@ -681,11 +821,15 @@ def cycle():
                 cm = prix_cardmarket(noms, str(res.get("numero")),
                                      str(res.get("total") or total_titre or ""),
                                      "reverse" in a["title"].lower())
+            if ok and not cm and res.get("type") in ("scelle", "lot", "autre", None):
+                cm = prix_scelle(res.get("nom_en") or "")
+                if cm:
+                    print(f"   📦 Trouvé dans le guide Cardmarket : {cm['nom']}")
 
         numero = str(res.get("numero") or num_titre or "")
         if cm:
             ref, source = cm["prix"], "Prix Cardmarket"
-            carte = f"{cm['nom']} {numero} – {cm['set']}".strip()
+            carte = (f"{cm['nom']} {numero} – {cm['set']}" if cm.get("set") else cm["nom"]).strip()
         elif ok:
             try:
                 ref = float(res.get("prix_revente") or 0)
@@ -703,13 +847,20 @@ def cycle():
 
         decote = round((1 - a["price"] / ref) * 100)
         cout, benef, roi = calcul_rentabilite(a["price"], ref)
-        print(f"   📊 {source} : {ref} € | -{decote} % | bénéfice {benef} € | ROI {roi} %")
+        ecart = f"-{decote} %" if decote >= 0 else f"+{-decote} % plus cher"
+        print(f"   📊 {source} : {ref} € | {ecart} | bénéfice {benef} € | ROI {roi} %")
+
+        comparees += 1
+        infos_courantes = {"source": source, "ref": ref, "carte": carte, "decote": decote,
+                           "cout": cout, "benef": benef, "roi": roi, "raison": res.get("raison"),
+                           "recherche": (cm or {}).get("nom") or res.get("nom_en") or a["title"]}
+        candidats.append((a, infos_courantes))
 
         if decote >= DECOTE_MIN and benef >= BENEF_MIN:
             infos = {"source": source, "ref": ref, "carte": carte, "decote": decote,
                      "cout": cout, "benef": benef, "roi": roi, "raison": res.get("raison")}
             recherche = (cm or {}).get("nom") or res.get("nom_en") or res.get("nom_fr") or a["title"]
-            if envoyer_telegram(formater(a, f"BON PLAN : -{decote} % SOUS CARDMARKET", infos),
+            if envoyer_telegram(formater(a, f"{niveau(decote, benef)} · -{decote} % SOUS CARDMARKET", infos),
                                 a["photo"], a["url"], recherche):
                 alertes += 1
                 print("   ✅ Alerte envoyée")
@@ -718,6 +869,22 @@ def cycle():
     if a_reessayer:
         print(f"🔁 {a_reessayer} annonce(s) seront réessayées au prochain run.")
     print(f"✨ Cycle terminé : {alertes} alerte(s).")
+
+    if RESUME_CHAQUE_RUN and alertes == 0:
+        top = sorted(candidats, key=lambda c: (c[1]["benef"], c[1]["decote"]), reverse=True)[:3]
+        stats = {"nouvelles": len(nouvelles), "comparees": comparees,
+                 "ecartees": ecartees, "attente": a_reessayer}
+        message = formater_bilan(stats, top)
+        if top:
+            a1, i1 = top[0]
+            autres = [{"text": f"{m} Vinted", "url": a["url"]}
+                      for m, (a, _) in zip(["🥈", "🥉"], top[1:])]
+            envoyer_telegram(message, a1.get("photo"), a1["url"], i1["recherche"],
+                             silencieux=RESUME_SILENCIEUX,
+                             lignes_boutons=[autres] if autres else None)
+        else:
+            envoyer_telegram(message, silencieux=RESUME_SILENCIEUX)
+        print("   📨 Bilan envoyé sur Telegram")
 
 def main():
     parser = argparse.ArgumentParser()
