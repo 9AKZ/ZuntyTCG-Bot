@@ -68,7 +68,26 @@ RECHERCHES = [
     "lot cartes pokemon",
 ]
 
-# Alerte immédiate (sans IA) si le titre contient le mot ET que le prix est <= au max
+# ===== ONE PIECE : uniquement les affaires EXTRÊMES, avec prix Cardmarket obligatoire =====
+ONE_PIECE_ACTIF = True
+RECHERCHES_ONE_PIECE = ["display one piece", "booster box one piece", "one piece card game scellé"]
+OP_DECOTE_MIN = 50      # au moins -50 % sous Cardmarket
+OP_BENEF_MIN = 25.0     # et au moins +25 € de bénéfice net
+
+# Cartes françaises ET anglaises uniquement : écarte les annonces qui précisent
+# une autre langue (japonais, chinois, coréen, allemand...)
+CARTES_FR_EN_SEULEMENT = True
+LANGUES_ETRANGERES = re.compile(
+    r"\b(jap|jp|japan|japanese|japonais|japonaise|chinese|chinois|chinoise|korean|coreen|"
+    r"coréen|coréenne|kr|cn|s-chinese|t-chinese|german|allemand|allemande|italian|italien|"
+    r"italienne|spanish|espagnol|espagnole|portugues|portugais)\b", re.I)
+
+# Mode continu : bilan Telegram toutes les X minutes (au lieu de chaque passage)
+BILAN_TOUTES_LES_MIN = 30
+
+# Watchlist : si le titre contient le mot ET que le prix est <= au max,
+# alerte dès qu'il y a un bénéfice (même sous la décote minimale).
+# Le prix Cardmarket est toujours vérifié avant.
 WATCHLIST = {
     "dracaufeu": 25,
     "charizard": 25,
@@ -76,7 +95,6 @@ WATCHLIST = {
     "etb": 35,
     "psa 10": 60,
     "alternative": 30,
-    "gold": 20,
 }
 
 # Annonces ignorées directement (faux, recherches, accessoires...)
@@ -89,7 +107,18 @@ MOTS_EXCLUS = [
     "nfl", "nba", "panini", "topps", "upper deck", "football", "baseball", "basket",
     "soccer", "one piece", "yu-gi-oh", "yugioh", "lorcana", "magic the gathering",
     "dragon ball", "digimon", "leaf ",
+    # célébrités, autres licences, autres sports
+    "trump", "biden", "macron", "président", "president", "elon", "wwe", "ufc", "f1 ",
+    "formule 1", "tennis", "rugby", "hockey", "nhl", "mlb", "marvel", "star wars",
+    "harry potter", "disney", "naruto", "dragon ball", "jujutsu", "demon slayer",
 ]
+# (les mots "one piece" sont exclus pour Pokémon, mais gérés à part si ONE_PIECE_ACTIF)
+POKEMON_INDICES = re.compile(r"(pok[eé]mon|pkmn|\betb\b|elite trainer|coffret dresseur|"
+                             r"pok[eé]ball|pikachu|dracaufeu|charizard|evoli|évoli|eevee|mewtwo|"
+                             r"\bmew\b|ronflex|lucario|rayquaza|umbreon|noctali|gengar|ectoplasma)", re.I)
+ONE_PIECE_INDICES = re.compile(r"(one piece|\bop-?\s?\d{1,2}\b|\beb-?\s?\d{1,2}\b|\bprb-?\s?\d{1,2}\b|"
+                               r"romance dawn|luffy)", re.I)
+MOTS_EXCLUS_OP_OK = {"one piece"}
 
 PRIX_MIN = 2.0          # en dessous : souvent des arnaques ou des cartes communes
 PRIX_MAX = 500.0        # au dessus : hors budget
@@ -313,7 +342,7 @@ def recuperer_annonces():
         return []
 
     annonces, vus = [], set()
-    for query in RECHERCHES:
+    for query in RECHERCHES + (RECHERCHES_ONE_PIECE if ONE_PIECE_ACTIF else []):
         items = None
         try:
             items = chercher_api(session, query)
@@ -333,9 +362,19 @@ def recuperer_annonces():
     return annonces
 
 # ================= FILTRES =================
+def jeu_de(a):
+    """'onepiece' si l'annonce parle de One Piece, sinon 'pokemon'."""
+    return "onepiece" if ONE_PIECE_INDICES.search(a["title"]) else "pokemon"
+
 def est_exclue(a):
     titre = a["title"].lower()
-    if any(m in titre for m in MOTS_EXCLUS):
+    jeu = jeu_de(a)
+    if jeu == "onepiece" and not ONE_PIECE_ACTIF:
+        return True
+    for m in MOTS_EXCLUS:
+        if m in titre and not (jeu == "onepiece" and m in MOTS_EXCLUS_OP_OK):
+            return True
+    if CARTES_FR_EN_SEULEMENT and LANGUES_ETRANGERES.search(titre):
         return True
     return not (PRIX_MIN <= a["price"] <= PRIX_MAX)
 
@@ -435,7 +474,8 @@ Réponds en JSON :
   "numero": "numéro de la carte ex 102 (vide si inconnu)",
   "total": "total du set ex 128 (vide si inconnu)",
   "prix_revente": prix Cardmarket FR estimé en euros,
-  "raison": "une phrase courte"}}"""
+  "raison": "une phrase courte EN FRANÇAIS"}}
+Toutes tes réponses texte doivent être en français."""
 
 # ================= PRIX CARDMARKET (via TCGdex, gratuit) =================
 TCGDEX = "https://api.tcgdex.net/v2"
@@ -520,53 +560,138 @@ ABREVIATIONS = [
 MOTS_VIDES_EN = {"pokemon", "tcg", "scelle", "sealed", "neuf", "new", "fr", "en", "eng",
                  "francais", "anglais", "english", "french", "the", "de", "la", "le", "et",
                  "a", "vendre", "pour", "avec", "of", "and", "edition", "version", "set"}
-_catalogue_scelle = None
+_catalogues = {}          # jeu -> liste de produits
+ID_JEU_CARDMARKET = {"pokemon": [6], "onepiece": [18, 19, 20, 21, 22, 17]}
+SIGNATURE_JEU = {"onepiece": ("romance dawn", "paramount war", "pillars of strength",
+                              "kingdoms of intrigue", "awakening of the new era")}
 
 def jetons(texte):
     t = unicodedata.normalize("NFKD", texte.lower()).encode("ascii", "ignore").decode()
     for motif, remplacement in ABREVIATIONS:
         t = re.sub(motif, remplacement, t)
+    t = re.sub(r"\b(op|eb|st|prb)\s*-?\s*(\d{1,2})\b",
+               lambda m: f"{m.group(1)}{int(m.group(2)):02d}", t)
     return [w for w in re.findall(r"[a-z0-9]+", t) if w not in MOTS_VIDES_EN]
 
-def charger_catalogue_scelle():
-    global _catalogue_scelle
-    if _catalogue_scelle is not None:
-        return _catalogue_scelle
-    _catalogue_scelle = []
-    try:
-        prods = requests.get(f"{CM_CATALOGUE}/productList/products_nonsingles_6.json",
-                             timeout=(5, 60)).json().get("products", [])
-        guide = requests.get(f"{CM_CATALOGUE}/priceGuide/price_guide_6.json",
-                             timeout=(5, 90)).json().get("priceGuides", [])
-        prix = {g.get("idProduct"): g for g in guide}
-        for pr in prods:
-            g = prix.get(pr.get("idProduct"))
-            ref = g and (g.get("trend") or g.get("avg30") or g.get("avg"))
-            if ref and pr.get("name"):
-                _catalogue_scelle.append((set(jetons(pr["name"])), pr["name"], float(ref)))
-        print(f"   📦 Guide de prix Cardmarket chargé : {len(_catalogue_scelle)} produits scellés")
-    except Exception as e:
-        print(f"   ⚠️ Guide de prix Cardmarket indisponible : {str(e)[:80]}")
-    return _catalogue_scelle
+def charger_catalogue_scelle(jeu="pokemon"):
+    """Télécharge (1 fois par run) le guide de prix Cardmarket des produits scellés."""
+    if jeu in _catalogues:
+        return _catalogues[jeu]
+    _catalogues[jeu] = []
+    for id_jeu in ID_JEU_CARDMARKET.get(jeu, []):
+        try:
+            prods = requests.get(f"{CM_CATALOGUE}/productList/products_nonsingles_{id_jeu}.json",
+                                 timeout=(5, 60)).json().get("products", [])
+            if jeu in SIGNATURE_JEU:
+                noms = " ".join(p.get("name", "").lower() for p in prods[:5000])
+                if not any(sig in noms for sig in SIGNATURE_JEU[jeu]):
+                    continue  # ce n'est pas le bon jeu, on essaie l'identifiant suivant
+            guide = requests.get(f"{CM_CATALOGUE}/priceGuide/price_guide_{id_jeu}.json",
+                                 timeout=(5, 90)).json().get("priceGuides", [])
+            prix = {g.get("idProduct"): g for g in guide}
+            for pr in prods:
+                g = prix.get(pr.get("idProduct"))
+                ref = g and (g.get("trend") or g.get("avg30") or g.get("avg"))
+                if ref and pr.get("name"):
+                    _catalogues[jeu].append((set(jetons(pr["name"])), pr["name"], float(ref)))
+            print(f"   📦 Guide de prix Cardmarket ({jeu}) chargé : {len(_catalogues[jeu])} produits")
+            break
+        except Exception as e:
+            print(f"   ⚠️ Guide de prix Cardmarket ({jeu}) indisponible : {str(e)[:80]}")
+    return _catalogues[jeu]
 
-def prix_scelle(requete):
-    """Trouve le produit scellé Cardmarket le plus proche de la requête."""
-    q = set(jetons(requete or ""))
-    if len(q) < 2:
+MOTS_TYPE = {"booster", "box", "elite", "trainer", "bundle", "collection", "premium", "ultra",
+             "pack", "blister", "tin", "mini", "deck", "starter", "double", "case", "3",
+             "build", "battle", "display", "sleeved", "half", "art"}
+MOTS_SERIE = {"scarlet", "violet", "sword", "shield", "sun", "moon", "black", "white",
+              "xy", "sv", "swsh", "sm", "one", "piece", "card", "game"}
+
+def fr_vers_en(texte):
+    """Remplace les noms d'extensions français par leur nom anglais (pour Cardmarket)."""
+    t = unicodedata.normalize("NFKD", texte.lower()).encode("ascii", "ignore").decode()
+    for en, fr in sorted(sets_en_vers_fr().items(), key=lambda x: -len(x[1])):
+        f = unicodedata.normalize("NFKD", fr.lower()).encode("ascii", "ignore").decode()
+        if len(f) > 3 and f in t:
+            t = t.replace(f, en)
+    return t
+
+def prix_scelle(requete, jeu="pokemon"):
+    """Trouve le produit scellé Cardmarket correspondant à la requête.
+    Le produit doit avoir TOUS ses mots de type (display, ETB...) dans la requête
+    et la majorité de ses mots d'extension."""
+    if not requete:
         return None
+    q = set(jetons(fr_vers_en(requete) if jeu == "pokemon" else requete))
     meilleur, meilleur_score = None, 0
-    for toks, nom, ref in charger_catalogue_scelle():
-        communs = len(q & toks)
-        if communs < 2 or communs / len(q) < 0.75:
+    for toks, nom, ref in charger_catalogue_scelle(jeu):
+        types_p = toks & MOTS_TYPE
+        set_p = toks - MOTS_TYPE - MOTS_SERIE
+        types_requis = types_p - {"booster"} if "bundle" in types_p else types_p
+        if not types_p or not set_p or not types_requis <= q:
             continue
-        if "case" in toks and "case" not in q:
-            continue  # "Booster Box Case" = plusieurs boîtes
-        score = communs / len(q) - 0.04 * len(toks - q)
+        communs = set_p & q
+        if not communs or len(communs) / len(set_p) < 0.6:
+            continue
+        score = len(communs) + len(types_p) - 0.1 * len(set_p - q)
         if score > meilleur_score:
             meilleur, meilleur_score = (nom, ref), score
     if meilleur:
-        return {"prix": round(meilleur[1], 2), "nom": meilleur[0], "set": ""}
+        return {"prix": round(meilleur[1], 2), "nom": meilleur[0], "set": "",
+                "nom_fr": traduire_produit(meilleur[0])}
     return None
+
+# ================= TRADUCTION EN FRANÇAIS =================
+TYPES_FR = [
+    ("ultra premium collection", "Coffret Ultra Premium"),
+    ("elite trainer box case", "Carton de Coffrets Dresseur d'Élite"),
+    ("elite trainer box", "Coffret Dresseur d'Élite (ETB)"),
+    ("booster box case", "Carton de Displays"),
+    ("booster box", "Display"),
+    ("booster bundle", "Bundle de boosters"),
+    ("build & battle box", "Kit Avant-Première"),
+    ("premium collection", "Coffret Premium"),
+    ("3 pack blister", "Tripack"),
+    ("mini tin", "Mini Pokébox"),
+    ("starter deck", "Deck de démarrage"),
+    ("double pack", "Double pack"),
+    ("collection box", "Coffret"),
+    ("collection", "Coffret"),
+    ("blister", "Blister"),
+    ("booster", "Booster"),
+    ("tin", "Pokébox"),
+]
+_sets_fr = None
+
+def sets_en_vers_fr():
+    """Noms des extensions Pokémon anglais -> français (via TCGdex)."""
+    global _sets_fr
+    if _sets_fr is None:
+        _sets_fr = {}
+        en = tcgdex_get("en/sets") or []
+        fr = {x.get("id"): x.get("name") for x in (tcgdex_get("fr/sets") or [])}
+        for x in en:
+            if x.get("name") and fr.get(x.get("id")):
+                _sets_fr[x["name"].lower()] = fr[x["id"]]
+    return _sets_fr
+
+def traduire_produit(nom):
+    """'Prismatic Evolutions Booster Box' -> 'Display Évolutions Prismatiques'."""
+    nom = re.sub(r"^(scarlet & violet|sword & shield|sun & moon|mega evolution|xy|"
+                 r"black & white)\s*[:\-–]\s*", "", nom, flags=re.I)
+    bas = nom.lower()
+    type_fr, reste = "", nom
+    for en, fr in TYPES_FR:
+        m = re.search(r"\b" + re.escape(en) + r"\b", bas)
+        if m:
+            type_fr = fr
+            reste = (nom[:m.start()] + nom[m.end():]).strip(" -:")
+            break
+    for en, fr in sorted(sets_en_vers_fr().items(), key=lambda x: -len(x[0])):
+        if en and en in reste.lower():
+            i = reste.lower().find(en)
+            reste = reste[:i] + fr + reste[i + len(en):]
+            break
+    return f"{type_fr} {reste}".strip() if type_fr else reste
 
 def calcul_rentabilite(prix, prix_revente):
     cout = prix + PROTECTION_FIXE + prix * PROTECTION_PCT + LIVRAISON
@@ -701,13 +826,13 @@ def formater(a, titre, infos=None):
             f"💰 Vinted <b>{euros(a['price'])}</b>  ➜  📊 Cardmarket <b>{euros(infos['ref'])}</b>",
             f"{jauge(infos['decote'])} <b>{'-' if infos['decote'] >= 0 else '+'}{abs(infos['decote'])} %</b>",
             f"💵 <b>Bénéfice net : {'+' if infos['benef'] >= 0 else ''}{euros(infos['benef'])}</b>"
-            f"  (ROI {infos['roi']} %)",
+            f"  (rentabilité {infos['roi']} %)",
             f"🧾 Coût réel (protection + port) : {euros(infos['cout'])}",
         ]
         if infos.get("carte"):
             lignes.append(f"🃏 {e(str(infos['carte'])[:80])}")
         if infos.get("source", "").startswith("Estimation"):
-            lignes.append("🤖 Prix estimé par l'IA (produit introuvable sur Cardmarket)")
+            lignes.append("🤖 Prix Cardmarket estimé par l'IA (produit non trouvé dans le guide)")
     details = " · ".join(x for x in [
         f"🏷️ {e(a['status'])}" if a.get("status") else "",
         f"👤 {e(a['vendeur'])}" if a.get("vendeur") else ""] if x)
@@ -720,17 +845,20 @@ def formater_bilan(stats, top):
     """Bilan d'un passage sans bon plan : stats + podium des meilleures affaires."""
     e = html.escape
     heure = datetime.now(ZoneInfo("Europe/Paris")).strftime("%H:%M")
-    lignes = [f"📋 <b>PASSAGE DE {heure}</b> · pas de bon plan", 
+    periode = stats.get("periode") or f"PASSAGE DE {heure}"
+    etat = (f"✅ {stats['alertes']} bon(s) plan(s) envoyé(s)" if stats.get("alertes")
+            else "pas de bon plan")
+    lignes = [f"📋 <b>{periode}</b> · {etat}",
               f"🆕 {stats['nouvelles']} nouvelles · 📊 {stats['comparees']} comparées"
               f" · 🚫 {stats['ecartees']} écartées"
               + (f" · ⏳ {stats['attente']} en attente" if stats['attente'] else "")]
     if top:
-        lignes += [SEP, "🏆 <b>TOP DU PASSAGE</b>"]
+        lignes += [SEP, "🏆 <b>PODIUM</b>"]
         for medaille, (a, inf) in zip(["🥇", "🥈", "🥉"], top):
             signe = "-" if inf["decote"] >= 0 else "+"
             b = f"{'+' if inf['benef'] >= 0 else ''}{euros(inf['benef'])}"
             lignes.append(f"{medaille} <b>{e(a['title'][:45])}</b>")
-            lignes.append(f"      {euros(a['price'])} vs {euros(inf['ref'])} CM · "
+            lignes.append(f"      {euros(a['price'])} au lieu de {euros(inf['ref'])} sur Cardmarket · "
                           f"{signe}{abs(inf['decote'])} % · {b}")
         a, inf = top[0]
         manque = []
@@ -741,7 +869,7 @@ def formater_bilan(stats, top):
         if manque:
             lignes.append(f"📏 Il manque {' et '.join(manque)} au 🥇 pour une alerte")
     else:
-        lignes += [SEP, "😴 Aucune annonce comparable ce coup-ci."]
+        lignes += [SEP, "😴 Aucune nouvelle annonce comparable sur cette période."]
     lignes += [SEP, f"🎯 Tes seuils : -{DECOTE_MIN} % et +{euros(BENEF_MIN)} de bénéfice"]
     return "\n".join(lignes)
 
@@ -758,11 +886,9 @@ def cycle():
     if premier_lancement and nouvelles:
         # Évite d'envoyer 100 alertes au tout premier lancement
         print("ℹ️ Premier lancement : annonces mémorisées sans alerte.")
-        if RESUME_CHAQUE_RUN:
-            envoyer_telegram(f"🤖 <b>ZuntyTCG-Bot démarré</b>\n{len(nouvelles)} annonces mémorisées. "
-                             "Les alertes arrivent dès le prochain passage.", silencieux=RESUME_SILENCIEUX)
         sauvegarder_historique([a["id"] for a in nouvelles])
-        return
+        return {"nouvelles": len(nouvelles), "comparees": 0, "ecartees": 0,
+                "attente": 0, "alertes": 0, "candidats": []}
 
     alertes = 0
     a_reessayer = 0
@@ -776,69 +902,76 @@ def cycle():
             ids.append(a["id"])
             continue
 
-        wl = match_watchlist(a)
-        if wl:
-            print(f"🎯 WATCHLIST '{wl[0]}' : {a['title']} — {a['price']} €")
-            if envoyer_telegram(formater(a, f"WATCHLIST : {wl[0]} ≤ {wl[1]} €"),
-                                a["photo"], a["url"], a["title"]):
-                alertes += 1
-            ids.append(a["id"])
-            continue
-
-        print(f"🔍 {a['title']} — {a['price']} €")
+        jeu = jeu_de(a)
+        wl = match_watchlist(a) if jeu == "pokemon" else None
+        print(f"🔍 [{'One Piece' if jeu == 'onepiece' else 'Pokémon'}] {a['title']} — {a['price']} €")
         est_gradee = bool(GRADEE.search(a["title"]))
         num_titre, total_titre = extraire_numero(a["title"])
         res, ok, cm = {}, False, None
 
-        # 1) Carte avec numéro dans le titre -> prix Cardmarket direct, SANS IA
-        if num_titre and not est_gradee:
+        # 1) Carte Pokémon avec numéro -> prix Cardmarket direct, SANS IA
+        if jeu == "pokemon" and num_titre and not est_gradee:
             cm = prix_cardmarket(mots_du_titre(a["title"]), num_titre, total_titre,
                                  "reverse" in a["title"].lower())
             if cm:
                 print("   ⚡ Trouvée sur Cardmarket sans IA")
 
-        # 1 bis) Produit scellé en anglais -> guide de prix Cardmarket, SANS IA
-        if not cm and not est_gradee and MOTS_SCELLES.search(a["title"]):
-            cm = prix_scelle(a["title"])
+        # 1 bis) Produit scellé -> guide de prix Cardmarket, SANS IA
+        if not cm and not est_gradee and (MOTS_SCELLES.search(a["title"]) or jeu == "onepiece"):
+            cm = prix_scelle(a["title"], jeu)
             if cm:
                 print(f"   ⚡ Trouvé dans le guide Cardmarket sans IA : {cm['nom']}")
 
-        # 2) Sinon : IA pour identifier (Pokémon ? faux ? quelle carte ? quel prix ?)
+        # 2) Sinon : IA pour identifier (vrai produit ? faux ? lequel ?)
         if not cm and ia_dispo and not ia_en_panne:
             r, ok = analyser(a)
             time.sleep(PAUSE_GEMINI)
             res = r if isinstance(r, dict) else {}
             if not ok:
                 ia_en_panne = True
-                print("   💤 IA indisponible : les annonces sans numéro attendront le prochain run")
-            elif res.get("faux") or res.get("suspect") or res.get("pokemon") is False:
+                print("   💤 IA indisponible : les annonces sans prix Cardmarket attendront")
+            elif res.get("faux") or res.get("suspect") or (jeu == "pokemon" and res.get("pokemon") is not True):
                 print(f"   🚫 écartée : {res.get('raison', '')}")
                 ecartees += 1
                 ids.append(a["id"])
                 continue
-            elif res.get("numero") and not est_gradee and res.get("type") not in ("gradee", "scelle"):
+            elif jeu == "pokemon" and res.get("numero") and not est_gradee \
+                    and res.get("type") not in ("gradee", "scelle"):
                 noms = [res.get("nom_fr"), res.get("nom_en")] + mots_du_titre(a["title"])
                 cm = prix_cardmarket(noms, str(res.get("numero")),
                                      str(res.get("total") or total_titre or ""),
                                      "reverse" in a["title"].lower())
             if ok and not cm and res.get("type") in ("scelle", "lot", "autre", None):
-                cm = prix_scelle(res.get("nom_en") or "")
+                cm = prix_scelle(res.get("nom_en") or "", jeu)
                 if cm:
                     print(f"   📦 Trouvé dans le guide Cardmarket : {cm['nom']}")
 
         numero = str(res.get("numero") or num_titre or "")
         if cm:
             ref, source = cm["prix"], "Prix Cardmarket"
-            carte = (f"{cm['nom']} {numero} – {cm['set']}" if cm.get("set") else cm["nom"]).strip()
-        elif ok:
+            nom_aff = cm.get("nom_fr") or cm["nom"]
+            carte = (f"{nom_aff} {numero} – {cm['set']}" if cm.get("set") else nom_aff).strip()
+        elif ok and jeu == "pokemon":
+            # Estimation IA acceptée seulement si c'est clairement du Pokémon
+            nom_ia = res.get("nom_fr") or ""
+            if not (POKEMON_INDICES.search(a["title"]) or
+                    (nom_ia and tcgdex_get("fr/cards", {"name": nom_ia.split()[0]}))):
+                print("   🚫 écartée : rien ne prouve que c'est du Pokémon")
+                ecartees += 1
+                ids.append(a["id"])
+                continue
             try:
                 ref = float(res.get("prix_revente") or 0)
             except (TypeError, ValueError):
                 ref = 0
-            source, carte = "Estimation IA (Cardmarket)", res.get("nom_fr") or ""
+            source, carte = "Estimation IA", nom_ia
+        elif ok:
+            # One Piece sans prix Cardmarket : on ignore (prix Cardmarket obligatoire)
+            print("   ⏭️ One Piece : pas de prix Cardmarket, ignoré")
+            ids.append(a["id"])
+            continue
         else:
-            # Ni IA ni Cardmarket : on réessaiera au prochain run
-            a_reessayer += 1
+            a_reessayer += 1  # ni IA ni Cardmarket : on réessaiera au prochain run
             continue
 
         ids.append(a["id"])
@@ -848,60 +981,120 @@ def cycle():
         decote = round((1 - a["price"] / ref) * 100)
         cout, benef, roi = calcul_rentabilite(a["price"], ref)
         ecart = f"-{decote} %" if decote >= 0 else f"+{-decote} % plus cher"
-        print(f"   📊 {source} : {ref} € | {ecart} | bénéfice {benef} € | ROI {roi} %")
+        print(f"   📊 {source} : {ref} € | {ecart} | bénéfice {benef} € | rentabilité {roi} %")
 
         comparees += 1
-        infos_courantes = {"source": source, "ref": ref, "carte": carte, "decote": decote,
-                           "cout": cout, "benef": benef, "roi": roi, "raison": res.get("raison"),
-                           "recherche": (cm or {}).get("nom") or res.get("nom_en") or a["title"]}
-        candidats.append((a, infos_courantes))
+        recherche = (cm or {}).get("nom") or res.get("nom_en") or res.get("nom_fr") or a["title"]
+        infos = {"source": source, "ref": ref, "carte": carte, "decote": decote, "cout": cout,
+                 "benef": benef, "roi": roi, "raison": res.get("raison"), "recherche": recherche}
+        candidats.append((a, infos))
 
-        if decote >= DECOTE_MIN and benef >= BENEF_MIN:
-            infos = {"source": source, "ref": ref, "carte": carte, "decote": decote,
-                     "cout": cout, "benef": benef, "roi": roi, "raison": res.get("raison")}
-            recherche = (cm or {}).get("nom") or res.get("nom_en") or res.get("nom_fr") or a["title"]
-            if envoyer_telegram(formater(a, f"{niveau(decote, benef)} · -{decote} % SOUS CARDMARKET", infos),
-                                a["photo"], a["url"], recherche):
-                alertes += 1
-                print("   ✅ Alerte envoyée")
+        if jeu == "onepiece":
+            alerte = decote >= OP_DECOTE_MIN and benef >= OP_BENEF_MIN
+            titre = f"🏴‍☠️ ONE PIECE EXTRÊME · -{decote} % SOUS CARDMARKET"
+        elif decote >= DECOTE_MIN and benef >= BENEF_MIN:
+            alerte, titre = True, f"{niveau(decote, benef)} · -{decote} % SOUS CARDMARKET"
+        elif wl and a["price"] <= wl[1] and benef >= BENEF_MIN:
+            alerte, titre = True, f"🎯 WATCHLIST « {wl[0]} » · -{decote} % SOUS CARDMARKET"
+        else:
+            alerte = False
+
+        if alerte and envoyer_telegram(formater(a, titre, infos), a["photo"], a["url"], recherche):
+            alertes += 1
+            print("   ✅ Alerte envoyée")
 
     sauvegarder_historique(ids)
     if a_reessayer:
         print(f"🔁 {a_reessayer} annonce(s) seront réessayées au prochain run.")
     print(f"✨ Cycle terminé : {alertes} alerte(s).")
 
-    if RESUME_CHAQUE_RUN and alertes == 0:
-        top = sorted(candidats, key=lambda c: (c[1]["benef"], c[1]["decote"]), reverse=True)[:3]
-        stats = {"nouvelles": len(nouvelles), "comparees": comparees,
-                 "ecartees": ecartees, "attente": a_reessayer}
-        message = formater_bilan(stats, top)
-        if top:
-            a1, i1 = top[0]
-            autres = [{"text": f"{m} Vinted", "url": a["url"]}
-                      for m, (a, _) in zip(["🥈", "🥉"], top[1:])]
-            envoyer_telegram(message, a1.get("photo"), a1["url"], i1["recherche"],
-                             silencieux=RESUME_SILENCIEUX,
-                             lignes_boutons=[autres] if autres else None)
-        else:
-            envoyer_telegram(message, silencieux=RESUME_SILENCIEUX)
-        print("   📨 Bilan envoyé sur Telegram")
+    return {"nouvelles": len(nouvelles), "comparees": comparees, "ecartees": ecartees,
+            "attente": a_reessayer, "alertes": alertes, "candidats": candidats}
+
+def envoyer_bilan(stats):
+    top = sorted(stats["candidats"], key=lambda c: (c[1]["benef"], c[1]["decote"]),
+                 reverse=True)[:3]
+    message = formater_bilan(stats, top)
+    if top:
+        a1, i1 = top[0]
+        autres = [{"text": f"{m} Vinted", "url": a["url"]}
+                  for m, (a, _) in zip(["🥈", "🥉"], top[1:])]
+        envoyer_telegram(message, a1.get("photo"), a1["url"], i1["recherche"],
+                         silencieux=RESUME_SILENCIEUX, lignes_boutons=[autres] if autres else None)
+    else:
+        envoyer_telegram(message, silencieux=RESUME_SILENCIEUX)
+    print("   📨 Bilan envoyé sur Telegram")
+
+def sauvegarde_github():
+    """Sur GitHub Actions : enregistre l'historique dans le dépôt (anti-doublons)."""
+    if not os.getenv("GITHUB_ACTIONS"):
+        return
+    import subprocess
+    cmds = [["git", "config", "user.name", "zuntytcg-bot"],
+            ["git", "config", "user.email", "bot@users.noreply.github.com"],
+            ["git", "add", HISTORIQUE_FILE],
+            ["git", "commit", "-m", "maj historique [skip ci]"],
+            ["git", "pull", "--rebase", "--autostash"],
+            ["git", "push"]]
+    for c in cmds:
+        subprocess.run(c, capture_output=True, timeout=60)
+    print("   💾 Historique sauvegardé sur GitHub")
+
+def fusionner(total, st):
+    for k in ("nouvelles", "comparees", "ecartees", "alertes"):
+        total[k] += st[k]
+    total["attente"] = st["attente"]
+    total["candidats"] += st["candidats"]
+
+def stats_vides():
+    return {"nouvelles": 0, "comparees": 0, "ecartees": 0, "attente": 0,
+            "alertes": 0, "candidats": []}
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", type=int, default=0,
                         help="intervalle en secondes pour tourner en continu")
+    parser.add_argument("--duree", type=int, default=0,
+                        help="durée max en minutes (0 = sans fin)")
     args = parser.parse_args()
 
     print("🚀 ZuntyTCG-Bot démarré")
     if not args.loop:
-        cycle()
+        st = cycle()
+        if RESUME_CHAQUE_RUN and st:
+            envoyer_bilan(st)
         return
+
+    debut = time.time()
+    fin = debut + args.duree * 60 if args.duree else None
+    envoyer_telegram("🟢 <b>ZuntyTCG-Bot en ligne</b>\n"
+                     f"Surveillance de Vinted toutes les ~{args.loop // 60 or 1} min"
+                     + (f" pendant {args.duree // 60} h {args.duree % 60:02d}" if args.duree else "")
+                     + f".\nBilan toutes les {BILAN_TOUTES_LES_MIN} min, alertes en direct 🔥",
+                     silencieux=RESUME_SILENCIEUX)
+    periode, debut_periode, premier = stats_vides(), time.time(), True
     while True:
         try:
-            cycle()
+            st = cycle()
+            if st:
+                fusionner(periode, st)
         except Exception as e:
             print(f"💥 Erreur inattendue : {e}")
+        maintenant = time.time()
+        if RESUME_CHAQUE_RUN and (premier or maintenant - debut_periode >= BILAN_TOUTES_LES_MIN * 60):
+            heure_debut = datetime.fromtimestamp(debut_periode, ZoneInfo("Europe/Paris")).strftime("%H:%M")
+            heure_fin = datetime.fromtimestamp(maintenant, ZoneInfo("Europe/Paris")).strftime("%H:%M")
+            periode["periode"] = f"BILAN {heure_debut} → {heure_fin}"
+            try:
+                envoyer_bilan(periode)
+                sauvegarde_github()
+            except Exception as e:
+                print(f"💥 Erreur bilan : {e}")
+            periode, debut_periode, premier = stats_vides(), maintenant, False
         attente = args.loop + random.randint(0, 20)
+        if fin and maintenant + attente >= fin:
+            print("🏁 Durée maximale atteinte : fin de la session (relance automatique)")
+            break
         print(f"⏳ Prochain passage dans {attente} s\n")
         time.sleep(attente)
 

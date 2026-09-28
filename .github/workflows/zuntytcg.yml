@@ -2,7 +2,7 @@ name: ZuntyTCG-Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"    # toutes les 5 min (GitHub peut avoir du retard)
+    - cron: "7 * * * *"      # toutes les heures : relance le bot s'il s'est arrêté
   workflow_dispatch:          # bouton "Run workflow" manuel
 
 permissions:
@@ -10,12 +10,12 @@ permissions:
 
 concurrency:
   group: zuntytcg-bot
-  cancel-in-progress: false   # empêche deux runs en même temps
+  cancel-in-progress: false   # un seul bot à la fois, le suivant attend son tour
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355      # GitHub autorise 6 h maximum par session
 
     steps:
       - name: 1. Récupération du code
@@ -30,9 +30,10 @@ jobs:
       - name: 3. Installation des dépendances
         run: pip install -r requirements.txt
 
-      - name: 4. Lancement de ZuntyTCG-Bot
-        timeout-minutes: 8
-        run: python -u ZuntyTCG-Bot.py
+      - name: 4. Surveillance en continu (≈ 5 h 30)
+        timeout-minutes: 345
+        # un passage toutes les ~2 min pendant 330 min, puis relance automatique
+        run: python -u ZuntyTCG-Bot.py --loop 120 --duree 330
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
