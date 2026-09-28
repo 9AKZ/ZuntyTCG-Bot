@@ -2,7 +2,7 @@ name: ZuntyTCG-Bot
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # toutes les 10 min (GitHub peut avoir du retard)
+    - cron: "*/5 * * * *"   # toutes les 10 min (GitHub peut avoir du retard)
   workflow_dispatch:          # bouton "Run workflow" manuel
 
 permissions:
