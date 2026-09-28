@@ -1,0 +1,49 @@
+name: ZuntyTCG-Bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # toutes les 10 min (GitHub peut avoir du retard)
+  workflow_dispatch:          # bouton "Run workflow" manuel
+
+permissions:
+  contents: write             # nécessaire pour sauvegarder l'historique
+
+concurrency:
+  group: zuntytcg-bot
+  cancel-in-progress: false   # empêche deux runs en même temps
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 1. Récupération du code
+        uses: actions/checkout@v4
+
+      - name: 2. Configuration de Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 3. Installation des dépendances
+        run: pip install -r requirements.txt
+
+      - name: 4. Lancement de ZuntyTCG-Bot
+        timeout-minutes: 8
+        run: python -u ZuntyTCG-Bot.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: 5. Sauvegarde de l'historique (Anti-doublons)
+        if: always()
+        run: |
+          git config user.name "zuntytcg-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add historique_vinted.json
+          git diff --staged --quiet || git commit -m "maj historique [skip ci]"
+          git pull --rebase --autostash || true
+          git push || echo "Push impossible, on réessaiera au prochain run"
