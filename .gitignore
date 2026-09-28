@@ -1,0 +1,3 @@
+.env
+__pycache__/
+zenty_tcg_bot_cache.json

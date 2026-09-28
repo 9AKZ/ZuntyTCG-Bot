@@ -1,0 +1,44 @@
+name: Bot Vinted Pokémon (ZuntyTCG)
+
+on:
+  schedule:
+    # Exécution automatique toutes les 15 minutes, 24h/24
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Bouton pour lancer le bot manuellement sur GitHub
+
+permissions:
+  contents: write # Nécessaire pour sauvegarder l'historique anti-doublons
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Récupération du code
+        uses: actions/checkout@v4
+
+      - name: 2. Configuration de Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 3. Installation des dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. Lancement de ZuntyTCG-Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python ZuntyTCG-Bot.py
+
+      - name: 5. Sauvegarde de l'historique (Anti-doublons)
+        run: |
+          git config --global user.name "ZuntyTCG-Bot[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add historique_vinted.json
+          git commit -m "update: mise à jour du cache des annonces [skip ci]" || exit 0
+          git push
