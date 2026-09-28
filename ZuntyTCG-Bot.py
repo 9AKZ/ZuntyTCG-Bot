@@ -31,6 +31,25 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # secours gratuit : console.groq.com/keys
+
+# Ordre de préférence. Les autres modèles disponibles sur ton compte
+# sont ajoutés automatiquement à la suite au démarrage.
+MODELES_SECOURS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+TOURS_MAX = 3           # nombre de tours complets sur tous les modèles
+PAUSE_TOUR = [5, 20, 45]  # attente (s) entre deux tours
+# Modèles essayés dans l'ordre si le principal est saturé (erreur 503/429)
+MODELES_SECOURS = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 
 HISTORIQUE_FILE = "historique_vinted.json"
 TIMEOUT = (5, 15)
@@ -78,10 +97,37 @@ ANALYSE_PHOTO = True    # envoie la photo à Gemini pour repérer les faux
 
 # ================= GEMINI =================
 client = None
+MODELES = []
+EXCLUS_MODELES = ("tts", "image", "embedding", "live", "audio", "veo", "imagen",
+                  "banana", "aqa", "robotics", "computer-use", "native", "lyria")
+
+def decouvrir_modeles():
+    """Liste de modèles à essayer : préférés d'abord, puis tous ceux du compte."""
+    ordre = [GEMINI_MODEL] + [m for m in MODELES_SECOURS if m != GEMINI_MODEL]
+    try:
+        dispo = []
+        for m in client.models.list():
+            nom = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "gemini" not in nom or any(x in nom for x in EXCLUS_MODELES):
+                continue
+            if actions and "generateContent" not in actions:
+                continue
+            dispo.append(nom)
+        if dispo:
+            ordre = [m for m in ordre if m in dispo] + sorted(
+                (m for m in dispo if m not in ordre),
+                key=lambda n: ("flash" not in n, "preview" in n or "exp" in n, n))
+    except Exception as e:
+        print(f"⚠️ Liste des modèles indisponible ({e}), liste par défaut utilisée.")
+    return list(dict.fromkeys(ordre))
+
 if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY,
                           http_options=types.HttpOptions(timeout=45000))
-    print(f"🤖 Gemini actif ({GEMINI_MODEL})")
+    MODELES = decouvrir_modeles()
+    print(f"🤖 Gemini actif : {len(MODELES)} modèles -> {', '.join(MODELES[:6])}"
+          + (" ..." if len(MODELES) > 6 else ""))
 else:
     print("⚠️ GEMINI_API_KEY absente : seule la WATCHLIST déclenchera des alertes.")
 
@@ -270,6 +316,54 @@ def match_watchlist(a):
             return mot, prix_max
     return None
 
+# ================= GROQ (secours gratuit) =================
+GROQ_URL = "https://api.groq.com/openai/v1"
+GROQ_PREFERES = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b",
+                 "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+GROQ_EXCLUS = ("whisper", "tts", "guard", "playai", "orpheus", "safeguard", "compound")
+GROQ_MODELES = []
+
+def decouvrir_groq():
+    if not GROQ_API_KEY:
+        return []
+    try:
+        r = requests.get(f"{GROQ_URL}/models", timeout=TIMEOUT,
+                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"})
+        dispo = [m["id"] for m in r.json().get("data", [])
+                 if m.get("active", True) and not any(x in m["id"] for x in GROQ_EXCLUS)]
+        if dispo:
+            return [m for m in GROQ_PREFERES if m in dispo] + sorted(
+                m for m in dispo if m not in GROQ_PREFERES)
+        print(f"⚠️ Groq : liste vide ({r.status_code}), liste par défaut utilisée.")
+    except Exception as e:
+        print(f"⚠️ Groq : liste indisponible ({e}), liste par défaut utilisée.")
+    return list(GROQ_PREFERES)
+
+GROQ_MODELES = decouvrir_groq()
+if GROQ_MODELES:
+    print(f"🦙 Secours Groq actif : {len(GROQ_MODELES)} modèles")
+
+def analyser_groq(prompt):
+    for modele in list(GROQ_MODELES):
+        try:
+            r = requests.post(f"{GROQ_URL}/chat/completions", timeout=(5, 40),
+                              headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                              json={"model": modele, "temperature": 0.2,
+                                    "response_format": {"type": "json_object"},
+                                    "messages": [{"role": "user", "content": prompt}]})
+            if r.status_code == 200:
+                texte = r.json()["choices"][0]["message"]["content"]
+                texte = texte.replace("```json", "").replace("```", "").strip()
+                res = json.loads(texte)
+                print(f"   🦙 Analysé par Groq ({modele})")
+                return res
+            if r.status_code == 404 and modele in GROQ_MODELES and len(GROQ_MODELES) > 1:
+                GROQ_MODELES.remove(modele)
+            print(f"   ⚠️ Groq {modele} : {r.status_code} -> modèle suivant")
+        except Exception as e:
+            print(f"   ⚠️ Groq {modele} : {str(e)[:80]} -> modèle suivant")
+    return None
+
 # ================= ANALYSE IA =================
 PROMPT = """Tu es un expert du marché français des cartes Pokémon (Cardmarket, eBay, Vinted).
 Analyse cette annonce Vinted :
@@ -282,6 +376,7 @@ en France (prix de vente constatés sur Cardmarket et Vinted, pas les prix deman
 en tenant compte de l'état, de l'édition, de la langue et de la demande.
 Sois prudent : en cas de doute, estime bas.
 Méfie-toi des faux, proxys, cartes abîmées et titres trompeurs (photo fournie si disponible).
+Si ce n'est PAS un produit Pokémon TCG (autre jeu, carte de sport, figurine...), mets "suspect": true.
 "score" = facilité de revente de 0 à 10 (10 = part en quelques jours).
 Réponds en JSON :
 {{"prix_revente": nombre en euros, "score": entier de 0 à 10,
@@ -304,24 +399,63 @@ def telecharger_image(url):
     return None, None
 
 def analyser(a):
-    if not client:
-        return None
-    contenu = [PROMPT.format(**a)]
+    """Essaie tous les modèles, plusieurs tours. Renvoie (resultat, ok).
+    ok=False seulement si TOUT a échoué -> l'annonce sera retentée au run suivant."""
+    if not (client and MODELES) and not GROQ_MODELES:
+        return None, False
+    prompt = PROMPT.format(**a)
+    contenu = [prompt]
     if ANALYSE_PHOTO and a.get("photo"):
         data, mime = telecharger_image(a["photo"])
         if data:
             contenu.append(types.Part.from_bytes(data=data, mime_type=mime))
-    try:
-        rep = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contenu,
-            config=types.GenerateContentConfig(response_mime_type="application/json",
-                                               temperature=0.2),
-        )
-        return json.loads(rep.text)
-    except Exception as e:
-        print(f"   ⚠️ Erreur Gemini : {e}")
-        return None
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        temperature=0.2,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+    gemini_ok = bool(client and MODELES)
+    for tour in range(TOURS_MAX):
+        for modele in (list(MODELES) if gemini_ok else []):
+            try:
+                rep = client.models.generate_content(model=modele, contents=contenu, config=config)
+                texte = (rep.text or "").replace("```json", "").replace("```", "").strip()
+                res = json.loads(texte)
+                if isinstance(res, list):
+                    res = res[0] if res else {}
+                if modele != MODELES[0]:
+                    # On garde en premier le modèle qui marche
+                    MODELES.remove(modele)
+                    MODELES.insert(0, modele)
+                    print(f"   🔁 Bascule sur {modele}")
+                return res, True
+            except json.JSONDecodeError:
+                print(f"   ⚠️ {modele} : réponse illisible, modèle suivant")
+            except Exception as e:
+                msg = str(e)
+                code = msg[:3]
+                if code in ("404", "400") and "API key" not in msg:
+                    # Modèle inexistant ou non autorisé : on le retire pour de bon
+                    print(f"   ❌ {modele} indisponible ({code}), retiré de la liste")
+                    if modele in MODELES and len(MODELES) > 1:
+                        MODELES.remove(modele)
+                elif "API key" in msg or code in ("401", "403"):
+                    print(f"   ⛔ Clé Gemini refusée : {msg[:150]}")
+                    gemini_ok = False
+                    break
+                else:
+                    print(f"   ⚠️ {modele} : {msg[:90]} -> modèle suivant")
+        if GROQ_MODELES:
+            res = analyser_groq(prompt)
+            if isinstance(res, dict):
+                return res, True
+        if tour < TOURS_MAX - 1:
+            attente = PAUSE_TOUR[min(tour, len(PAUSE_TOUR) - 1)]
+            print(f"   ⏳ Tous les modèles ont échoué, nouvel essai dans {attente} s")
+            time.sleep(attente)
+    print("   ⚠️ Analyse impossible pour l'instant, annonce gardée pour le prochain run")
+    return None, False
 
 # ================= MESSAGE =================
 def formater(a, source, analyse=None):
@@ -358,9 +492,10 @@ def cycle():
         return
 
     alertes = 0
+    a_reessayer = 0
     for a in nouvelles:
-        ids.append(a["id"])
         if est_exclue(a):
+            ids.append(a["id"])
             continue
 
         wl = match_watchlist(a)
@@ -368,14 +503,23 @@ def cycle():
             print(f"🎯 WATCHLIST '{wl[0]}' : {a['title']} — {a['price']} €")
             if envoyer_telegram(formater(a, f"WATCHLIST : {wl[0]} ≤ {wl[1]} €"), a["photo"], a["url"]):
                 alertes += 1
+            ids.append(a["id"])
             continue
 
-        if not client:
+        if not client and not GROQ_MODELES:
+            ids.append(a["id"])
             continue
+        if gemini_en_panne:
+            continue  # gardée pour le prochain run
         print(f"🔍 IA : {a['title']} — {a['price']} €")
         res = analyser(a)
         time.sleep(PAUSE_GEMINI)
-        if not res or res.get("suspect"):
+        if res is None:
+            a_reessayer += 1  # pas mémorisée -> réanalysée au prochain run
+            continue
+        ids.append(a["id"])
+        if res.get("suspect"):
+            print(f"   🚫 écartée : {res.get('raison', '')}")
             continue
         try:
             score = int(res.get("score", 0))
@@ -391,6 +535,8 @@ def cycle():
                 print("   ✅ Alerte envoyée")
 
     sauvegarder_historique(ids)
+    if a_reessayer:
+        print(f"🔁 {a_reessayer} annonce(s) seront réessayées au prochain run.")
     print(f"✨ Cycle terminé : {alertes} alerte(s).")
 
 def main():
