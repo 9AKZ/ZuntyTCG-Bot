@@ -11,6 +11,7 @@ import json
 import time
 import html
 import random
+import re
 import argparse
 import requests
 
@@ -63,8 +64,15 @@ MOTS_EXCLUS = [
 
 PRIX_MIN = 2.0          # en dessous : souvent des arnaques ou des cartes communes
 PRIX_MAX = 500.0        # au dessus : hors budget
-SCORE_ALERTE = 7        # note Gemini minimale (sur 10) pour alerter
-REDUCTION_MIN = 35      # % de réduction estimée minimale
+SCORE_ALERTE = 7        # note de revendabilité minimale (sur 10)
+BENEF_MIN = 10.0        # bénéfice net minimum en € pour alerter
+ROI_MIN = 30            # rentabilité minimale en % (bénéfice / coût d'achat)
+
+# Coûts réels d'un achat Vinted (à ajuster si besoin)
+PROTECTION_FIXE = 0.70  # protection acheteurs : 0,70 € + 5 % du prix
+PROTECTION_PCT = 0.05
+LIVRAISON = 3.50        # frais de port moyens à l'achat
+FRAIS_REVENTE_PCT = 0.05  # commission à la revente (Cardmarket ~5 %, Vinted 0 %)
 PAUSE_GEMINI = 4        # secondes entre deux appels (quota gratuit)
 ANALYSE_PHOTO = True    # envoie la photo à Gemini pour repérer les faux
 
@@ -119,23 +127,39 @@ def envoyer_telegram(message, photo_url=None, lien=None):
         print(f"   ⚠️ Exception Telegram : {e}")
         return False
 
-# ================= VINTED =================
+# ================= VINTED (nouvelle API sept. 2026) =================
+WWW = "https://www.vinted.fr"
+API = "https://api.vinted.fr/svc-catalogue/items"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+                  "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9",
 }
 
 def nouvelle_session():
+    """Récupère le jeton anonyme que Vinted donne à tout visiteur."""
     s = requests.Session()
     s.headers.update(HEADERS)
-    r = s.get("https://www.vinted.fr/", timeout=TIMEOUT)
-    print(f"🌐 Session Vinted : {r.status_code}")
+    r = s.get(f"{WWW}/catalog", timeout=TIMEOUT,
+              headers={"Accept": "text/html,application/xhtml+xml"})
+    token = s.cookies.get("access_token_web")
+    anon_id = r.headers.get("x-anon-id") or s.cookies.get("anon_id")
+    csrf = re.search(r'CSRF_TOKEN\\?"\s*:\s*\\?"([^"\\]+)', r.text)
+    print(f"🌐 Session Vinted : {r.status_code} | jeton : {'OK' if token else 'ABSENT'}")
+
+    s.headers.update({"Accept": "application/json, text/plain, */*",
+                      "Origin": WWW, "Referer": f"{WWW}/catalog"})
+    if token:
+        s.headers["Authorization"] = f"Bearer {token}"
+    if anon_id:
+        s.headers["X-Anon-Id"] = anon_id
+    if csrf:
+        s.headers["X-Csrf-Token"] = csrf.group(1)
     return s
 
 def extraire_prix(item):
-    p = item.get("price")
+    p = item.get("price") or item.get("offers", {}).get("price")
     if isinstance(p, dict):
         p = p.get("amount")
     try:
@@ -143,24 +167,67 @@ def extraire_prix(item):
     except (TypeError, ValueError):
         return 0.0
 
-def chercher(session, query, essais=3):
-    for essai in range(1, essais + 1):
+def extraire_photo(item):
+    photo = item.get("photo")
+    if not photo and item.get("photos"):
+        photo = item["photos"][0]
+    if not photo:
+        photo = item.get("image")
+    if isinstance(photo, list):
+        photo = photo[0] if photo else None
+    if isinstance(photo, dict):
+        photo = photo.get("url") or photo.get("full_size_url") or photo.get("contentUrl")
+    return photo
+
+def normaliser(item):
+    url = item.get("url") or ""
+    if url.startswith("/"):
+        url = WWW + url
+    item_id = item.get("id")
+    if not item_id:
+        m = re.search(r"/items/(\d+)", url)
+        item_id = m.group(1) if m else None
+    if not item_id:
+        return None
+    user = item.get("user") or {}
+    return {
+        "id": f"vinted_{item_id}",
+        "title": item.get("title") or item.get("name") or "Sans titre",
+        "price": extraire_prix(item),
+        "url": url or f"{WWW}/items/{item_id}",
+        "photo": extraire_photo(item),
+        "status": item.get("status") or item.get("item_condition") or "",
+        "vendeur": user.get("login", "") if isinstance(user, dict) else "",
+    }
+
+def chercher_api(session, query):
+    r = session.get(API, timeout=TIMEOUT, params={
+        "search_text": query, "order": "newest_first", "page": 1,
+        "per_page": 30, "time": int(time.time()), "currency": "EUR"})
+    if r.status_code != 200:
+        print(f"   ⚠️ API '{query}' -> {r.status_code} {r.text[:150]}")
+        return None
+    data = r.json()
+    return data.get("items") or data.get("catalog_items") or []
+
+def chercher_page(session, query):
+    """Secours : lit les annonces dans le JSON-LD de la page catalogue."""
+    r = session.get(f"{WWW}/catalog", timeout=TIMEOUT,
+                    params={"search_text": query, "order": "newest_first"},
+                    headers={"Accept": "text/html"})
+    if r.status_code != 200:
+        print(f"   ⚠️ Page '{query}' -> {r.status_code}")
+        return []
+    items = []
+    for bloc in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', r.text, re.S):
         try:
-            r = session.get("https://www.vinted.fr/api/v2/catalog/items", timeout=TIMEOUT, params={
-                "search_text": query, "order": "newest_first", "per_page": 30})
-            if r.status_code == 200:
-                return r.json().get("items", [])
-            if r.status_code == 401:  # cookie expiré -> on renouvelle
-                session.cookies.clear()
-                session.get("https://www.vinted.fr/", timeout=TIMEOUT)
-            elif r.status_code == 403:
-                print("   ⛔ 403 : Vinted bloque cette IP (fréquent sur GitHub Actions).")
-                return []
-            print(f"   ⚠️ '{query}' -> {r.status_code} (essai {essai}/{essais})")
-        except Exception as e:
-            print(f"   ⚠️ '{query}' -> {e} (essai {essai}/{essais})")
-        time.sleep(2 * essai + random.random())
-    return []
+            data = json.loads(bloc)
+        except ValueError:
+            continue
+        for d in (data if isinstance(data, list) else [data]):
+            for el in d.get("itemListElement", []) if isinstance(d, dict) else []:
+                items.append(el.get("item", el))
+    return items
 
 def recuperer_annonces():
     try:
@@ -171,22 +238,21 @@ def recuperer_annonces():
 
     annonces, vus = [], set()
     for query in RECHERCHES:
-        items = chercher(session, query)
+        items = None
+        try:
+            items = chercher_api(session, query)
+            if items is None:
+                items = chercher_page(session, query)
+                print(f"   ↪️ secours page catalogue : {len(items)} annonces")
+        except Exception as e:
+            print(f"   ⚠️ '{query}' -> {e}")
+            items = []
         print(f"📡 '{query}' : {len(items)} annonces")
         for item in items:
-            item_id = item.get("id")
-            if not item_id or item_id in vus:
-                continue
-            vus.add(item_id)
-            annonces.append({
-                "id": f"vinted_{item_id}",
-                "title": item.get("title", "Sans titre"),
-                "price": extraire_prix(item),
-                "url": item.get("url") or f"https://www.vinted.fr/items/{item_id}",
-                "photo": (item.get("photo") or {}).get("url"),
-                "status": item.get("status", ""),
-                "vendeur": (item.get("user") or {}).get("login", ""),
-            })
+            a = normaliser(item)
+            if a and a["id"] not in vus:
+                vus.add(a["id"])
+                annonces.append(a)
         time.sleep(1.5 + random.random())
     return annonces
 
@@ -211,11 +277,22 @@ Analyse cette annonce Vinted :
 - Prix : {price} €
 - État : {status}
 
-Estime le prix de marché réel en France, puis juge si c'est une affaire.
+Objectif : ACHAT-REVENTE. Estime le prix auquel cette annonce se REVEND réellement
+en France (prix de vente constatés sur Cardmarket et Vinted, pas les prix demandés),
+en tenant compte de l'état, de l'édition, de la langue et de la demande.
+Sois prudent : en cas de doute, estime bas.
 Méfie-toi des faux, proxys, cartes abîmées et titres trompeurs (photo fournie si disponible).
+"score" = facilité de revente de 0 à 10 (10 = part en quelques jours).
 Réponds en JSON :
-{{"prix_marche": nombre en euros, "reduction_pct": nombre, "score": entier de 0 à 10,
+{{"prix_revente": nombre en euros, "score": entier de 0 à 10,
   "suspect": true ou false, "raison": "une phrase courte"}}"""
+
+def calcul_rentabilite(prix, prix_revente):
+    cout = prix + PROTECTION_FIXE + prix * PROTECTION_PCT + LIVRAISON
+    net_revente = prix_revente * (1 - FRAIS_REVENTE_PCT)
+    benef = net_revente - cout
+    roi = benef / cout * 100 if cout else 0
+    return round(cout, 2), round(benef, 2), round(roi)
 
 def telecharger_image(url):
     try:
@@ -253,9 +330,10 @@ def formater(a, source, analyse=None):
               f"📦 <b>{e(a['title'])}</b>",
               f"💰 <b>{a['price']:.2f} €</b>"]
     if analyse:
-        lignes.append(f"📊 Marché estimé : ~{analyse.get('prix_marche', '?')} € "
-                      f"(-{analyse.get('reduction_pct', '?')}%)")
-        lignes.append(f"⭐ Score : {analyse.get('score', '?')}/10")
+        lignes.append(f"🧾 Coût total (protection + port) : {analyse['cout']} €")
+        lignes.append(f"📈 Revente estimée : ~{analyse.get('prix_revente', '?')} €")
+        lignes.append(f"💵 <b>Bénéfice net : +{analyse['benef']} € (ROI {analyse['roi']} %)</b>")
+        lignes.append(f"⭐ Revendabilité : {analyse.get('score', '?')}/10")
         lignes.append(f"💡 {e(str(analyse.get('raison', '')))}")
     if a.get("status"):
         lignes.append(f"🏷️ État : {e(a['status'])}")
@@ -301,13 +379,16 @@ def cycle():
             continue
         try:
             score = int(res.get("score", 0))
-            reduc = float(res.get("reduction_pct", 0))
+            revente = float(res.get("prix_revente", 0))
         except (TypeError, ValueError):
             continue
-        if score >= SCORE_ALERTE and reduc >= REDUCTION_MIN:
-            if envoyer_telegram(formater(a, "BON PLAN DÉTECTÉ PAR L'IA", res), a["photo"], a["url"]):
+        cout, benef, roi = calcul_rentabilite(a["price"], revente)
+        res.update(cout=cout, benef=benef, roi=roi)
+        print(f"   💶 revente ~{revente} € | bénéfice {benef} € | ROI {roi} % | score {score}")
+        if score >= SCORE_ALERTE and benef >= BENEF_MIN and roi >= ROI_MIN:
+            if envoyer_telegram(formater(a, "ACHAT-REVENTE RENTABLE", res), a["photo"], a["url"]):
                 alertes += 1
-                print(f"   ✅ Alerte envoyée (score {score}, -{reduc}%)")
+                print("   ✅ Alerte envoyée")
 
     sauvegarder_historique(ids)
     print(f"✨ Cycle terminé : {alertes} alerte(s).")
