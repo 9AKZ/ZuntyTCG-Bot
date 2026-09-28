@@ -493,6 +493,7 @@ def cycle():
 
     alertes = 0
     a_reessayer = 0
+    ia_en_panne = False
     for a in nouvelles:
         if est_exclue(a):
             ids.append(a["id"])
@@ -509,13 +510,16 @@ def cycle():
         if not client and not GROQ_MODELES:
             ids.append(a["id"])
             continue
-        if gemini_en_panne:
-            continue  # gardée pour le prochain run
+        if ia_en_panne:
+            a_reessayer += 1  # gardée pour le prochain run
+            continue
         print(f"🔍 IA : {a['title']} — {a['price']} €")
-        res = analyser(a)
+        res, ok = analyser(a)
         time.sleep(PAUSE_GEMINI)
-        if res is None:
+        if not ok or not isinstance(res, dict):
             a_reessayer += 1  # pas mémorisée -> réanalysée au prochain run
+            ia_en_panne = True
+            print("   💤 IA indisponible : les annonces restantes seront analysées au prochain run")
             continue
         ids.append(a["id"])
         if res.get("suspect"):
