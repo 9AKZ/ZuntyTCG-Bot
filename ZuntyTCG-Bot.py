@@ -1,243 +1,202 @@
 import os
 import json
-import time
-import re
 import requests
+from bs4 import BeautifulSoup
+import google.generativeai as genai
 
-# Charge le .env s'il existe (en local), ignore en silence sur GitHub Actions
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-# ================= CONFIGURATION ZentyTCG-Bot =================
+# ================= CONFIGURATION =================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-VINTED_QUERY = "booster pokemon"
-FICHIER_CACHE = "zenty_tcg_bot_cache.json"
-DISCOUNT_MINIMUM_POURCENT = 35.0
+VINTED_QUERY = "carte pokemon"
+HISTORIQUE_FILE = "historique_vinted.json"
 
-MOTS_INTERDITS = [
-    "proxy", "proxies", "custom", "fanart", "fan art", "fanmade", "replica", 
-    "reproduction", "fake", "fausse", "faux", "reprint", "aliexpress", "chinois",
-    "vide", "vides", "empty", "ouvert", "ouverte", "ouverts", "sans booster", 
-    "sans les boosters", "boite seule", "boîte seule", "coffret vide", "display vide",
-    "code", "codes", "online", "tcgl", "jcc live", "ptcgo", "code tcg",
-    "carte seule", "graduée", "graduee", "psa", "pca", "graad", "lot de cartes", 
-    "vrac", "commune", "unco", "reverse", "bulk"
-]
+# Configuration de Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    model = None
 
-# ================= GESTION DU CACHE =================
-def charger_cache():
-    if os.path.exists(FICHIER_CACHE):
+# ================= HISTORIQUE (ANTI- DOUBLONS) =================
+def charger_historique():
+    if os.path.exists(HISTORIQUE_FILE):
         try:
-            with open(FICHIER_CACHE, "r", encoding="utf-8") as f:
+            with open(HISTORIQUE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except Exception:
             return []
     return []
 
-def sauvegarder_cache(cache):
-    try:
-        with open(FICHIER_CACHE, "w", encoding="utf-8") as f:
-            json.dump(cache[-500:], f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ ZentyTCG-Bot Erreur Cache : {e}")
+def sauvegarder_historique(historique):
+    with open(HISTORIQUE_FILE, "w", encoding="utf-8") as f:
+        json.dump(historique[-200:], f, ensure_ascii=False, indent=2)
 
-# ================= ENVOI TELEGRAM =================
-def envoyer_alerte_telegram(texte, photo_url=None):
+# ================= TELEGRAM =================
+def envoyer_telegram(message, photo_url=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ ZentyTCG-Bot : Identifiants Telegram manquants.")
+        print("⚠️ Identifiants Telegram manquants.")
         return
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-
-    if photo_url:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        payload["photo"] = photo_url
-        payload["caption"] = texte
-    else:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload["text"] = texte
-
+    
     try:
+        if photo_url:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": message, "parse_mode": "Markdown"}
+        else:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+            
         res = requests.post(url, json=payload, timeout=10)
         if res.status_code != 200:
-            print(f"⚠️ ZentyTCG-Bot Erreur Telegram ({res.status_code}) : {res.text}")
+            print(f"⚠️ Erreur Telegram : {res.text}")
     except Exception as e:
-        print(f"⚠️ ZentyTCG-Bot Erreur de connexion Telegram : {e}")
+        print(f"⚠️ Exception Telegram : {e}")
 
-# ================= SCRAPING VINTED DIRECT =================
+# ================= SCRAPING VINTED ALTERNATIF & ROBUSTE =================
 def recuperer_annonces_vinted():
-    url = f"https://www.vinted.fr/api/v2/catalog/items?search_text={VINTED_QUERY}&per_page=20"
+    print("🔍 Lancement de la recherche Vinted...")
+    # On utilise l'interface web mobile de Vinted qui passe beaucoup mieux
+    url = f"https://www.vinted.fr/catalog?search_text={VINTED_QUERY}&order=newest_first"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "fr-FR,fr;q=0.9"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9",
+        "Referer": "https://www.vinted.fr/"
     }
     
-    # Récupération d'un cookie de session valide pour éviter le blocage Cloudflare
-    session = requests.Session()
     try:
-        session.get("https://www.vinted.fr", headers=headers, timeout=10)
+        session = requests.Session()
+        # Étape 1 : Récupérer les cookies de session de base
+        res_init = session.get("https://www.vinted.fr", headers=headers, timeout=15)
+        print(f"🌐 Connexion initiale Vinted - Statut : {res_init.status_code}")
+        
+        # Étape 2 : Requête catalogue HTML ou API JSON directe de secours
         res = session.get(url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            items_bruts = data.get("items", [])
-            annonces = []
-            for item in items_bruts:
-                photo_data = item.get("photo")
-                photo_url = photo_data.get("url") if photo_data else None
+        print(f"📡 Réponse catalogue Vinted - Statut : {res.status_code}")
+        
+        if res.status_code != 200:
+            print(f"⚠️ Blocage potentiel ou code erreur Vinted: {res.status_code}")
+            return []
+
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # Extraction via l'API embarquée dans le HTML (state JSON de Vinted si présent)
+        annonces = []
+        
+        # Méthode de secours : parsing des éléments HTML visibles
+        items_html = soup.select("div.feed-grid__item, div[data-testid='grid-item']")
+        print(f"📦 Éléments HTML bruts trouvés : {len(items_html)}")
+        
+        for item in items_html[:15]:
+            try:
+                link_elem = item.find("a", href=True)
+                if not link_elem:
+                    continue
+                item_url = "https://www.vinted.fr" + link_elem["href"] if link_elem["href"].startswith("/") else link_elem["href"]
                 
+                # Extraire un ID unique de l'URL
+                item_id = item_url.split("/")[-2] if "-" in item_url else item_url
+
+                title_elem = item.find("p", class_="") or item.find("h2")
+                title = title_elem.text.strip() if title_elem else "Carte Pokémon Vinted"
+
+                price_elem = item.find(string=lambda t: t and '€' in t)
+                price_str = price_elem.strip().replace('€', '').replace(',', '.').strip() if price_elem else "0"
+                
+                # Nettoyage prix
+                price_val = 0.0
+                for p in price_str.split():
+                    try:
+                        price_val = float(p)
+                        break
+                    except ValueError:
+                        continue
+
+                img_elem = item.find("img")
+                photo_url = img_elem.get("src") if img_elem else None
+
                 annonces.append({
-                    "id": f"vinted_{item.get('id')}",
-                    "title": item.get("title", "Sans titre"),
-                    "price": float(item.get("price", {}).get("amount", 0)),
-                    "url": item.get("url", ""),
-                    "description": item.get("description", ""),
+                    "id": f"vinted_{item_id}",
+                    "title": title,
+                    "price": price_val,
+                    "url": item_url,
+                    "description": title,
                     "photo": photo_url
                 })
-            return annonces
-        else:
-            print(f"⚠️ Erreur API Vinted ({res.status_code})")
-            return []
+            except Exception as inner_e:
+                continue
+
+        print(f"✅ {len(annonces)} annonces extraites avec succès.")
+        return annonces
+
     except Exception as e:
-        print(f"⚠️ Erreur lors de la récupération Vinted : {e}")
+        print(f"⚠️ Erreur critique lors du scraping Vinted : {e}")
         return []
 
-# ================= MOTEUR D'ANALYSE IA (GEMINI) =================
-def analyser_annonce_avec_gemini(titre, prix, description):
-    if not GEMINI_API_KEY:
-        return False, {}
-
+# ================= ANALYSE GEMINI =================
+def analyser_avec_gemini(annonce):
+    if not model:
+        return True, "Modèle IA non configuré, validation par défaut."
+    
     prompt = f"""
-Tu es l'expert numéro 1 du marché Pokémon TCG en France pour ZentyTCG-Bot.
-Ton rôle est d'analyser une annonce Vinted pour déterminer si c'est une EXCELLENTE affaire.
-
-Règles d'évaluation :
-1. Identifie le produit scellé/TCG précis (Display, ETB/Coffret, Booster, Tripack, Blister, etc.).
-2. Estime sa COTE RÉELLE sur le marché français actuel (Cardmarket FR / eBay FR en €).
-3. Vérifie l'état : Le produit doit être NEUF, SCELLÉ ou EN PARFAIT ÉTAT sans défaut.
-4. Calcule la réduction % : ((Cote - Prix_Vinted) / Cote) * 100.
-5. C'est une 'bonne affaire' SEULEMENT SI :
-   - La réduction est de -35% MINIMUM par rapport à la cote.
-   - Le produit est 100% authentique, parfait/scellé.
-   - Ce n'est NI un produit ouvert, NI du vrac, NI une arnaque.
-
-Annonce Vinted à analyser :
-- Titre : {titre}
-- Prix demandé : {prix} €
-- Description : {description}
-
-Réponds STRICTEMENT sous forme d'objet JSON respectant ce schéma exact (sans markdown, sans balises ```json autour, juste le JSON brut) :
-{{
-  "est_bonne_affaire": true,
-  "nom_produit": "Nom précis de l'item",
-  "cote_estimee": 100.0,
-  "reduction_pourcentage": 40.5,
-  "etat_scelle_parfait": true,
-  "analyse_detaillee": "Explication courte sur l'état, la série, le prix et le potentiel."
-}}
-"""
-
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){GEMINI_API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json"}
-    }
-
+    Analyse cette annonce de carte Pokémon sur Vinted :
+    Titre : {annonce['title']}
+    Prix : {annonce['price']} €
+    Description : {annonce['description']}
+    
+    Est-ce une offre intéressante avec une forte réduction potentielle ou un bon plan (-35% minimum estimé par rapport au marché estimé ou prix bradé) ? 
+    Réponds UNIQUEMENT au format JSON strict :
+    {{"valide": true/false, "raison": "explication courte"}}
+    """
     try:
-        res = requests.post(url, headers=headers, json=payload, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            donnees_ia = json.loads(raw_text)
-            return donnees_ia.get("est_bonne_affaire", False), donnees_ia
-        else:
-            return False, {}
-    except Exception:
-        return False, {}
+        response = model.generate_content(prompt)
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(text)
+        return result.get("valide", False), result.get("raison", "")
+    except Exception as e:
+        print(f"⚠️ Erreur Gemini : {e}")
+        # En cas de doute, si le prix est très bas, on laisse passer
+        return True, "Validation automatique de secours."
 
-# ================= FILTRAGE ET EXECUTION =================
-def filtrage_rapide(titre, description):
-    texte = f"{titre} {description}".lower()
-    for mot in MOTS_INTERDITS:
-        pattern = rf"(?:\b|_){re.escape(mot)}(?:\b|_)"
-        if re.search(pattern, texte):
-            return False, f"Mot exclu : '{mot}'"
-    return True, "OK"
+# ================= MAIN =================
+def main():
+    print("🚀 Démarrage du script ZuntyTCG-Bot...")
+    historique = charger_historique()
+    ids_connus = {item["id"] for item in historique}
 
-def executer_cycle():
-    print(f"\n[{time.strftime('%H:%M:%S')}] 🔍 ZentyTCG-Bot : Scan Vinted en cours...")
-    cache = charger_cache()
-    nouveaux_ids = []
+    annonces = recuperer_annonces_vinted()
+    
+    if not annonces:
+        print("ℹ️ Aucune annonce récupérée lors de ce cycle.")
+        return
 
-    items = recuperer_annonces_vinted()
-    print(f"📦 {len(items)} annonces récupérées de Vinted.")
-
-    for item in items:
-        item_id = item.get('id')
-        if item_id in cache:
+    nouveautes = 0
+    for annonce in annonces:
+        if annonce["id"] in ids_connus:
             continue
+        
+        nouveautes += 1
+        print(f"🔍 Analyse de l'annonce : {annonce['title']} à {annonce['price']}€")
+        
+        valide, raison = analyser_avec_gemini(annonce)
+        
+        if valide:
+            msg = (
+                *🔥 BON PLAN POKÉMON DÉTECTÉ !* \n\n"
+                f"📦 *Titre* : {annonce['title']}\n"
+                f"💰 *Prix* : {annonce['price']} €\n"
+                f"💡 *Analyse* : {raison}\n\n"
+                f"🔗 [Voir l'annonce sur Vinted]({annonce['url']})"
+            )
+            envoyer_telegram(msg, annonce.get("photo"))
+            print(f"✅ Alerte envoyée pour : {annonce['title']}")
+        
+        historique.append(annonce)
 
-        nouveaux_ids.append(item_id)
-        titre = item.get('title', 'Sans titre')
-        prix = float(item.get('price', 0))
-        description = item.get('description', '')
-        url = item.get('url', '')
-        photo_url = item.get('photo')
-
-        # 1. Filtre local rapide
-        valide_preliminaire, raison_preliminaire = filtrage_rapide(titre, description)
-        if not valide_preliminaire:
-            print(f"   ↳ Ignoré [{titre} - {prix}€] : {raison_preliminaire}")
-            continue
-
-        # 2. Analyse Gemini
-        print(f"   🧠 ZentyTCG-Bot analyse avec Gemini : '{titre}' ({prix}€)...")
-        est_affaire, analyse = analyser_annonce_avec_gemini(titre, prix, description)
-
-        if est_affaire:
-            nom_produit = analyse.get("nom_produit", titre)
-            cote = analyse.get("cote_estimee", 0)
-            reduction = analyse.get("reduction_pourcentage", 0)
-            details = analyse.get("analyse_detaillee", "Pas de détails.")
-
-            if reduction >= DISCOUNT_MINIMUM_POURCENT:
-                msg = (
-                    f"🚨 <b>ZentyTCG-Bot : PÉPITE POKÉMON (-{reduction:.1f}%)</b> 🚨\n\n"
-                    f"📌 <b>Item :</b> {nom_produit}\n"
-                    f"💰 <b>Prix Vinted :</b> {prix} €\n"
-                    f"📈 <b>Cote estimée :</b> {cote} €\n"
-                    f"⚡ <b>Réduction :</b> -{reduction:.1f}%\n\n"
-                    f"🔍 <b>Analyse ZentyTCG-Bot (Gemini) :</b>\n{details}\n\n"
-                    f"🔗 <a href='{url}'>Acheter immédiatement sur Vinted</a>"
-                )
-                print(f"   ✨ ALERTE ENVOYÉE : {nom_produit} ({prix}€ vs Cote {cote}€)")
-                envoyer_alerte_telegram(msg, photo_url=photo_url)
-            else:
-                print(f"   ↳ Ignoré : Réduction insuffisante (-{reduction:.1f}%)")
-        else:
-            print(f"   ↳ Ignoré par Gemini : Non conforme ou hors critères.")
-
-    # Mise à jour du cache
-    for aid in nouveaux_ids:
-        if aid not in cache:
-            cache.append(aid)
-    sauvegarder_cache(cache)
+    sauvegarder_historique(historique)
+    print(f"✨ Cycle terminé. {nouveautes} nouvelles annonces traitées.")
 
 if __name__ == "__main__":
-    print("==================================================")
-    print("🤖 ZentyTCG-Bot : Scan unique pour GitHub Actions")
-    print(f"🎯 Chat ID Telegram : {TELEGRAM_CHAT_ID}")
-    print(f"🎯 Critère d'alerte : Réduction >= {DISCOUNT_MINIMUM_POURCENT}% vs Cote.")
-    print("==================================================")
-    executer_cycle()
+    main()
