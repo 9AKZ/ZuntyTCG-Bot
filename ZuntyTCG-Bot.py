@@ -79,11 +79,20 @@ OP_BENEF_MIN = 25.0     # et au moins +25 € de bénéfice net
 
 # Cartes françaises ET anglaises uniquement : écarte les annonces qui précisent
 # une autre langue (japonais, chinois, coréen, allemand...)
+# Langues acceptées : FRANÇAIS, JAPONAIS et ANGLAIS. Tout le reste est écarté
+# (italien, espagnol, allemand, portugais, néerlandais, polonais, chinois, coréen...)
 CARTES_FR_EN_SEULEMENT = True
 LANGUES_ETRANGERES = re.compile(
-    r"\b(jap|jp|japan|japanese|japonais|japonaise|chinese|chinois|chinoise|korean|coreen|"
-    r"coréen|coréenne|kr|cn|s-chinese|t-chinese|german|allemand|allemande|italian|italien|"
-    r"italienne|spanish|espagnol|espagnole|portugues|portugais)\b", re.I)
+    r"\b(chinese|chinois|chinoise|korean|coreen|coréen|coréenne|kr|cn|s-chinese|t-chinese|"
+    r"german|allemand|allemande|deutsch|italian|italien|italienne|italiano|italiana|ita|"
+    r"spanish|espagnol|espagnole|español|espanol|esp|portugues|português|portugais|"
+    r"dutch|néerlandais|neerlandais|nederlands|polish|polonais|polski|thai|indonesian|"
+    r"indonésien)\b", re.I)
+# Mots typiques d'annonces rédigées dans une autre langue (titre écrit en italien, espagnol...)
+MOTS_AUTRES_LANGUES = re.compile(
+    r"\b(carta|cartas|nuovo|nuova|nuevo|nueva|novo|nova|sigillat[oaie]|sellad[oa]s?|selad[oa]|"
+    r"bustin[ae]|busta|caja|scatola|colección|coleccion|collezione|karte|karten|neu|"
+    r"versiegelt|sammlung|kaart|kaarten|nieuw|karta|karty|nowe|zapakowan[ey]|rzadk[aie])\b", re.I)
 
 # ===== PRIORITÉ AU FRANÇAIS =====
 # Les annonces en anglais ne sont signalées que si l'affaire est vraiment énorme,
@@ -103,9 +112,19 @@ MOTS_EN = {"card", "cards", "new", "sealed", "english", "eng", "en", "with", "th
 VENDEUR_AVIS_MIN = 2
 VENDEUR_NOTE_MIN = 4.0
 VENDEUR_INCONNU_OK = False   # si les avis sont introuvables : pas d'alerte
-# Pays où Vinted existe (écarte les vendeurs d'ailleurs)
-PAYS_VINTED = {"FR", "BE", "LU", "NL", "ES", "PT", "IT", "DE", "AT", "PL", "CZ", "SK", "LT",
-               "LV", "EE", "SE", "DK", "FI", "HU", "RO", "HR", "SI", "GR", "IE", "GB", "UK"}
+# Pays d'où on peut acheter depuis Vinted France (Union européenne, pas de douane).
+# États-Unis, Royaume-Uni, Canada... sont écartés.
+PAYS_AUTORISES = {"FR", "BE", "LU", "NL", "DE", "AT", "ES", "PT", "IT", "PL", "CZ", "SK",
+                  "LT", "LV", "EE", "SE", "DK", "FI", "HU", "RO", "HR", "SI", "GR", "IE"}
+# Devises des pays autorisés (une annonce en dollars ou en livres = hors zone)
+DEVISES_OK = {"EUR", "PLN", "CZK", "SEK", "DKK", "HUF", "RON"}
+DOMAINES_PAYS = {"vinted.fr": "FR", "vinted.be": "BE", "vinted.lu": "LU", "vinted.nl": "NL",
+                 "vinted.de": "DE", "vinted.at": "AT", "vinted.es": "ES", "vinted.pt": "PT",
+                 "vinted.it": "IT", "vinted.pl": "PL", "vinted.cz": "CZ", "vinted.sk": "SK",
+                 "vinted.lt": "LT", "vinted.lv": "LV", "vinted.ee": "EE", "vinted.se": "SE",
+                 "vinted.dk": "DK", "vinted.fi": "FI", "vinted.hu": "HU", "vinted.ro": "RO",
+                 "vinted.hr": "HR", "vinted.si": "SI", "vinted.gr": "GR", "vinted.ie": "IE",
+                 "vinted.com": "US", "vinted.co.uk": "GB", "vinted.ca": "CA"}
 # Produits scellés (ETB, display, bundle...) : "scellé" doit être écrit
 # dans le titre ou la description, sinon pas d'alerte
 EXIGER_SCELLE = True
@@ -305,6 +324,19 @@ def nouvelle_session():
         s.headers["X-Csrf-Token"] = csrf.group(1)
     return s
 
+def devise_de(item):
+    p = item.get("price")
+    if isinstance(p, dict):
+        return (p.get("currency_code") or "").upper() or None
+    return (item.get("currency") or "").upper() or None
+
+def pays_du_site(url):
+    """Pays du site Vinted de l'annonce. vinted.fr affiche aussi des vendeurs
+    d'autres pays : on ne s'en sert que pour repérer les sites étrangers (US, UK...)."""
+    m = re.search(r"https?://(?:www\.)?([a-z.]+?)/", url or "")
+    pays = DOMAINES_PAYS.get(m.group(1)) if m else None
+    return None if pays == "FR" else pays
+
 def extraire_prix(item):
     p = item.get("price") or item.get("offers", {}).get("price")
     if isinstance(p, dict):
@@ -346,6 +378,8 @@ def normaliser(item):
         "status": item.get("status") or item.get("item_condition") or "",
         "vendeur": user.get("login", "") if isinstance(user, dict) else "",
         "_user": user if isinstance(user, dict) else {},
+        "devise": devise_de(item),
+        "pays_site": pays_du_site(url),
     }
 
 def chercher_api(session, query):
@@ -410,8 +444,11 @@ def recuperer_annonces():
 
 # ================= FILTRES =================
 def langue_annonce(a):
-    """'fr', 'en' ou '?' d'après les mots du titre."""
+    """'fr', 'ja', 'en' ou '?' d'après les mots du titre."""
     titre = a["title"].lower()
+    if re.search(r"\b(jap|jp|japan|japanese|japonais|japonaise|japonaises)\b", titre) \
+            or re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", a["title"]):
+        return "ja"
     if re.search(r"[éèêàçùûôî]", titre):
         return "fr"
     mots = set(re.findall(r"[a-z]+", titre))
@@ -437,7 +474,13 @@ def est_exclue(a):
         if re.search(r"(?<![a-zà-ÿ])" + re.escape(m.strip()) + r"(?![a-zà-ÿ])", titre) \
                 and not (jeu == "onepiece" and m in MOTS_EXCLUS_OP_OK):
             return True
-    if CARTES_FR_EN_SEULEMENT and LANGUES_ETRANGERES.search(titre):
+    if CARTES_FR_EN_SEULEMENT and (LANGUES_ETRANGERES.search(titre) or
+                                   MOTS_AUTRES_LANGUES.search(titre)):
+        return True
+    # Vendeur d'un pays où on ne peut pas acheter depuis Vinted France
+    if a.get("devise") and a["devise"] not in DEVISES_OK:
+        return True
+    if a.get("pays_site") and a["pays_site"] not in PAYS_AUTORISES:
         return True
     return not (PRIX_MIN <= a["price"] <= PRIX_MAX)
 
@@ -943,8 +986,11 @@ def verifier_annonce(a, scelle):
             return False, f"vendeur avec seulement {d['avis']} avis (arnaque probable)", d
         if d["note"] < VENDEUR_NOTE_MIN:
             return False, f"vendeur noté {d['note']}/5 seulement", d
-    if d["pays"] and d["pays"].upper() not in PAYS_VINTED:
-        return False, f"vendeur situé hors Europe ({d['pays']})", d
+    pays = (d["pays"] or a.get("pays_site") or "").upper()
+    if pays and pays not in PAYS_AUTORISES:
+        return False, f"vendeur situé dans un pays où on ne peut pas acheter ({pays})", d
+    if not pays and langue_annonce(a) != "fr":
+        return False, "pays du vendeur inconnu (annonce non française)", d
     return True, "", d
 
 def texte_vendeur(a, d):
@@ -979,7 +1025,7 @@ def niveau(decote, benef):
 def formater(a, titre, infos=None):
     """Alerte bon plan."""
     e = html.escape
-    drapeau = {"fr": "🇫🇷 ", "en": "🇬🇧 "}.get((infos or {}).get("langue"), "")
+    drapeau = {"fr": "🇫🇷 ", "en": "🇬🇧 ", "ja": "🇯🇵 "}.get((infos or {}).get("langue"), "")
     lignes = [f"<b>{titre}</b>", SEP, f"📦 {drapeau}<b>{e(a['title'][:90])}</b>"]
     if infos:
         lignes += [
@@ -1020,7 +1066,7 @@ def formater_bilan(stats, top):
         for medaille, (a, inf) in zip(["🥇", "🥈", "🥉"], top):
             signe = "-" if inf["decote"] >= 0 else "+"
             b = f"{'+' if inf['benef'] >= 0 else ''}{euros(inf['benef'])}"
-            drapeau = {"fr": "🇫🇷 ", "en": "🇬🇧 "}.get(inf.get("langue"), "")
+            drapeau = {"fr": "🇫🇷 ", "en": "🇬🇧 ", "ja": "🇯🇵 "}.get(inf.get("langue"), "")
             lignes.append(f"{medaille} {drapeau}<b>{e(a['title'][:45])}</b>")
             lignes.append(f"      {euros(a['price'])} au lieu de {euros(inf['ref'])} sur Cardmarket · "
                           f"{signe}{abs(inf['decote'])} % · {b}")
