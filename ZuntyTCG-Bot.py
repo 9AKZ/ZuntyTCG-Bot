@@ -217,11 +217,10 @@ def executer_cycle():
 # ================= BOUCLE PRINCIPALE =================
 if __name__ == "__main__":
     print("==================================================")
-    print("🤖 ZentyTCG-Bot actif et connecté à Gemini !")
+    print("🤖 ZentyTCG-Bot : Scan unique pour GitHub Actions")
     print(f"🎯 Chat ID Telegram : {TELEGRAM_CHAT_ID}")
     print(f"🎯 Critère d'alerte : Réduction >= {DISCOUNT_MINIMUM_POURCENT}% vs Cote.")
     print("==================================================")
 
-    while True:
-        executer_cycle()
-        time.sleep(INTERVALLE_SCAN_SECONDES)
+    # Exécution unique par lancement (GitHub Actions relancera le script toutes les 15 min)
+    executer_cycle()
