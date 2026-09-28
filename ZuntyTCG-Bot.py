@@ -3,11 +3,14 @@ import json
 import time
 import re
 import requests
-from dotenv import load_dotenv
 from vinted_scraper import VintedScraper
 
-# Charge automatiquement les clés depuis le fichier .env
-load_dotenv()
+# Charge le .env s'il existe (en local), ignore en silence sur GitHub Actions
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ================= CONFIGURATION ZentyTCG-Bot =================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -16,8 +19,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 VINTED_QUERY = "booster pokemon"
 FICHIER_CACHE = "zenty_tcg_bot_cache.json"
-INTERVALLE_SCAN_SECONDES = 60  # Scan toutes les 60 secondes
-DISCOUNT_MINIMUM_POURCENT = 35.0  # Réduction minimale (-35% vs Cote)
+INTERVALLE_SCAN_SECONDES = 60
+DISCOUNT_MINIMUM_POURCENT = 35.0
 
 MOTS_INTERDITS = [
     # Faux / Proxies
