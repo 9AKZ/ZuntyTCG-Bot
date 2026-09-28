@@ -46,10 +46,12 @@ MODELES_SECOURS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 ]
+# IA utilisée en premier : "groq" (gratuit, gros quota) ou "gemini"
+IA_PRINCIPALE = os.getenv("IA_PRINCIPALE", "groq")
+GEMINI_ACTIF = True     # mets False pour ne plus du tout utiliser Gemini
 TOURS_MAX = 3           # nombre de tours complets sur tous les modèles
+GEMINI_ESSAIS_MAX = 4   # modèles Gemini essayés avant de passer à Groq
 PAUSE_TOUR = [5, 20, 45]  # attente (s) entre deux tours
-# Modèles essayés dans l'ordre si le principal est saturé (erreur 503/429)
-MODELES_SECOURS = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
 
 HISTORIQUE_FILE = "historique_vinted.json"
 TIMEOUT = (5, 15)
@@ -78,14 +80,21 @@ WATCHLIST = {
 MOTS_EXCLUS = [
     "proxy", "fake", "custom", "réplique", "replica", "goldée", "metal", "métal",
     "recherche", "cherche", "classeur vide", "sleeve", "protège", "pochette", "peluche",
-    "figurine", "jeu vidéo", "switch", "3ds",
+    "figurine", "jeu vidéo", "switch", "3ds", "fan art", "fanart", "mega construx",
+    "lego", "funko",
+    # autres jeux / cartes de sport
+    "nfl", "nba", "panini", "topps", "upper deck", "football", "baseball", "basket",
+    "soccer", "one piece", "yu-gi-oh", "yugioh", "lorcana", "magic the gathering",
+    "dragon ball", "digimon", "leaf ",
 ]
 
 PRIX_MIN = 2.0          # en dessous : souvent des arnaques ou des cartes communes
 PRIX_MAX = 500.0        # au dessus : hors budget
-SCORE_ALERTE = 7        # note de revendabilité minimale (sur 10)
-BENEF_MIN = 10.0        # bénéfice net minimum en € pour alerter
-ROI_MIN = 30            # rentabilité minimale en % (bénéfice / coût d'achat)
+# ===== RÈGLE D'ALERTE =====
+# Alerte si : produit Pokémon + prix au moins DECOTE_MIN % sous le prix Cardmarket
+# + bénéfice net (après frais Vinted, port et commission) >= BENEF_MIN
+DECOTE_MIN = 30         # % minimum sous le prix Cardmarket
+BENEF_MIN = 3.0         # bénéfice net minimum en €
 
 # Coûts réels d'un achat Vinted (à ajuster si besoin)
 PROTECTION_FIXE = 0.70  # protection acheteurs : 0,70 € + 5 % du prix
@@ -122,7 +131,7 @@ def decouvrir_modeles():
         print(f"⚠️ Liste des modèles indisponible ({e}), liste par défaut utilisée.")
     return list(dict.fromkeys(ordre))
 
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and GEMINI_ACTIF:
     client = genai.Client(api_key=GEMINI_API_KEY,
                           http_options=types.HttpOptions(timeout=45000))
     MODELES = decouvrir_modeles()
@@ -145,12 +154,19 @@ def sauvegarder_historique(ids):
         json.dump(ids[-2000:], f, indent=2)
 
 # ================= TELEGRAM =================
-def envoyer_telegram(message, photo_url=None, lien=None):
+def envoyer_telegram(message, photo_url=None, lien=None, recherche_cm=None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Identifiants Telegram manquants.")
         return False
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    clavier = {"inline_keyboard": [[{"text": "🛒 Ouvrir sur Vinted", "url": lien}]]} if lien else None
+    boutons = []
+    if lien:
+        boutons.append({"text": "🛒 Vinted", "url": lien})
+    if recherche_cm:
+        boutons.append({"text": "📊 Cardmarket", "url":
+                        "https://www.cardmarket.com/fr/Pokemon/Products/Search?searchString="
+                        + requests.utils.quote(recherche_cm)})
+    clavier = {"inline_keyboard": [boutons]} if boutons else None
 
     def post(methode, payload):
         if clavier:
@@ -341,7 +357,8 @@ def decouvrir_groq():
 
 GROQ_MODELES = decouvrir_groq()
 if GROQ_MODELES:
-    print(f"🦙 Secours Groq actif : {len(GROQ_MODELES)} modèles")
+    print(f"🦙 Groq actif : {len(GROQ_MODELES)} modèles"
+          + (" (IA principale)" if IA_PRINCIPALE == "groq" else " (secours)"))
 
 def analyser_groq(prompt):
     for modele in list(GROQ_MODELES):
@@ -357,15 +374,23 @@ def analyser_groq(prompt):
                 res = json.loads(texte)
                 print(f"   🦙 Analysé par Groq ({modele})")
                 return res
-            if r.status_code == 404 and modele in GROQ_MODELES and len(GROQ_MODELES) > 1:
+            if r.status_code in (400, 404) and modele in GROQ_MODELES and len(GROQ_MODELES) > 1:
                 GROQ_MODELES.remove(modele)
-            print(f"   ⚠️ Groq {modele} : {r.status_code} -> modèle suivant")
+                print(f"   ❌ Groq {modele} indisponible ({r.status_code}), retiré")
+            elif r.status_code == 429 and modele in GROQ_MODELES and len(GROQ_MODELES) > 1:
+                # quota atteint sur ce modèle : on le met en fin de liste
+                GROQ_MODELES.remove(modele)
+                GROQ_MODELES.append(modele)
+                print(f"   🪫 Groq {modele} : quota atteint -> modèle suivant")
+            else:
+                print(f"   ⚠️ Groq {modele} : {r.status_code} -> modèle suivant")
         except Exception as e:
             print(f"   ⚠️ Groq {modele} : {str(e)[:80]} -> modèle suivant")
     return None
 
 # ================= ANALYSE IA =================
-PROMPT = """Tu es un expert du marché français des cartes Pokémon (Cardmarket, eBay, Vinted).
+PROMPT = """Nous sommes le {date}. Tu es un expert du marché français des cartes Pokémon
+(Cardmarket, eBay, Vinted).
 Analyse cette annonce Vinted :
 - Titre : {title}
 - Prix : {price} €
@@ -375,12 +400,97 @@ Objectif : ACHAT-REVENTE. Estime le prix auquel cette annonce se REVEND réellem
 en France (prix de vente constatés sur Cardmarket et Vinted, pas les prix demandés),
 en tenant compte de l'état, de l'édition, de la langue et de la demande.
 Sois prudent : en cas de doute, estime bas.
-Méfie-toi des faux, proxys, cartes abîmées et titres trompeurs (photo fournie si disponible).
-Si ce n'est PAS un produit Pokémon TCG (autre jeu, carte de sport, figurine...), mets "suspect": true.
-"score" = facilité de revente de 0 à 10 (10 = part en quelques jours).
+
+IMPORTANT : tes connaissances s'arrêtent avant aujourd'hui. De nouvelles séries,
+extensions, coffrets et promos sortent en permanence (ex : produits du 30e anniversaire
+Pokémon en 2026, séries Méga-Évolution, Légendes Z-A / Illumis-Lumiose...).
+Ne considère JAMAIS un produit comme faux uniquement parce que tu ne le connais pas.
+Pour un produit récent que tu ne connais pas, estime sa valeur d'après son type
+(display, ETB, coffret, carte ultra rare...) et mets un score plus bas.
+
+"faux": true UNIQUEMENT si signes clairs : "proxy", "fan art", "custom", "réplique",
+carte en métal/dorée non officielle, texte ou visuel visiblement faux sur la photo.
+"pokemon": false si ce n'est PAS un produit Pokémon TCG (autre jeu, carte de sport,
+jouet, Mega Construx, figurine...).
+
+Identifie aussi le produit le plus précisément possible.
 Réponds en JSON :
-{{"prix_revente": nombre en euros, "score": entier de 0 à 10,
-  "suspect": true ou false, "raison": "une phrase courte"}}"""
+{{"pokemon": true ou false, "faux": true ou false,
+  "type": "carte" ou "gradee" ou "scelle" ou "lot" ou "autre",
+  "nom_fr": "nom français de la carte ou du produit", "nom_en": "nom anglais",
+  "numero": "numéro de la carte ex 102 (vide si inconnu)",
+  "total": "total du set ex 128 (vide si inconnu)",
+  "prix_revente": prix Cardmarket FR estimé en euros,
+  "raison": "une phrase courte"}}"""
+
+# ================= PRIX CARDMARKET (via TCGdex, gratuit) =================
+TCGDEX = "https://api.tcgdex.net/v2"
+_cache_tcgdex = {}
+MOTS_VIDES = {
+    "carte", "cartes", "pokemon", "pokémon", "holo", "reverse", "rare", "ultra", "secret",
+    "full", "art", "alternative", "alt", "promo", "neuf", "mint", "near", "lot", "card",
+    "cards", "francaise", "française", "francais", "français", "anglaise", "japonaise",
+    "fr", "eng", "en", "jp", "jap", "vf", "etat", "état", "tbe", "be", "tcg", "set", "the",
+    "and", "les", "des", "une", "avec", "pour", "edition", "édition", "illustration",
+}
+GRADEE = re.compile(r"\b(psa|cgc|bgs|pca|egc|beckett|collect aura|grad[ée]e?)\b", re.I)
+
+def tcgdex_get(chemin, params=None):
+    cle = (chemin, tuple(sorted((params or {}).items())))
+    if cle in _cache_tcgdex:
+        return _cache_tcgdex[cle]
+    data = None
+    try:
+        r = requests.get(f"{TCGDEX}/{chemin}", params=params, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+    except Exception:
+        pass
+    _cache_tcgdex[cle] = data
+    return data
+
+def extraire_numero(titre):
+    m = re.search(r"\b([A-Za-z]{0,4}\d{1,3})\s*/\s*([A-Za-z]{0,4}\d{1,3})\b", titre)
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+def mots_du_titre(titre):
+    mots = re.findall(r"[A-Za-zÀ-ÿ\-']{3,}", titre)
+    return [m for m in mots if m.lower() not in MOTS_VIDES][:4]
+
+def prix_cardmarket(noms, numero, total, reverse=False):
+    """Cherche la carte sur TCGdex et renvoie le prix Cardmarket (tendance)."""
+    numero = (numero or "").strip()
+    if not numero:
+        return None
+    variantes = {numero, numero.lstrip("0") or "0"}
+    if numero.isdigit():
+        variantes.add(numero.zfill(3))
+    filtre_num = "eq:" + "|".join(sorted(variantes))
+    total_int = int(re.sub(r"\D", "", total)) if re.sub(r"\D", "", total or "") else None
+
+    for langue in ("fr", "en"):
+        for nom in [n for n in noms if n][:5]:
+            res = tcgdex_get(f"{langue}/cards", {"name": nom, "localId": filtre_num})
+            if not isinstance(res, list):
+                continue
+            for brief in res[:6]:
+                carte = tcgdex_get(f"{langue}/cards/{brief.get('id')}")
+                if not isinstance(carte, dict):
+                    continue
+                nb = ((carte.get("set") or {}).get("cardCount") or {})
+                if total_int and total_int not in (nb.get("official"), nb.get("total")):
+                    continue
+                cm = (carte.get("pricing") or {}).get("cardmarket") or {}
+                if reverse:
+                    ref = cm.get("trend-holo") or cm.get("avg30-holo") or cm.get("avg-holo")
+                else:
+                    ref = None
+                ref = ref or cm.get("trend") or cm.get("avg30") or cm.get("avg")
+                if ref:
+                    return {"prix": round(float(ref), 2), "nom": carte.get("name"),
+                            "set": (carte.get("set") or {}).get("name", ""),
+                            "id": carte.get("id")}
+    return None
 
 def calcul_rentabilite(prix, prix_revente):
     cout = prix + PROTECTION_FIXE + prix * PROTECTION_PCT + LIVRAISON
@@ -398,12 +508,15 @@ def telecharger_image(url):
         pass
     return None, None
 
+GEMINI_ECHECS = 0
+GEMINI_ECHECS_MAX = 3   # après 3 échecs complets, Gemini est ignoré jusqu'au run suivant
+
 def analyser(a):
     """Essaie tous les modèles, plusieurs tours. Renvoie (resultat, ok).
     ok=False seulement si TOUT a échoué -> l'annonce sera retentée au run suivant."""
     if not (client and MODELES) and not GROQ_MODELES:
         return None, False
-    prompt = PROMPT.format(**a)
+    prompt = PROMPT.format(date=time.strftime("%d/%m/%Y"), **a)
     contenu = [prompt]
     if ANALYSE_PHOTO and a.get("photo"):
         data, mime = telecharger_image(a["photo"])
@@ -415,9 +528,18 @@ def analyser(a):
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
-    gemini_ok = bool(client and MODELES)
+    global GEMINI_ECHECS
+    gemini_ok = bool(client and MODELES) and GEMINI_ECHECS < GEMINI_ECHECS_MAX
     for tour in range(TOURS_MAX):
+        if IA_PRINCIPALE == "groq" and GROQ_MODELES:
+            res = analyser_groq(prompt)
+            if isinstance(res, dict):
+                return res, True
+        essais = 0
         for modele in (list(MODELES) if gemini_ok else []):
+            if essais >= GEMINI_ESSAIS_MAX:
+                break
+            essais += 1
             try:
                 rep = client.models.generate_content(model=modele, contents=contenu, config=config)
                 texte = (rep.text or "").replace("```json", "").replace("```", "").strip()
@@ -429,6 +551,7 @@ def analyser(a):
                     MODELES.remove(modele)
                     MODELES.insert(0, modele)
                     print(f"   🔁 Bascule sur {modele}")
+                GEMINI_ECHECS = 0
                 return res, True
             except json.JSONDecodeError:
                 print(f"   ⚠️ {modele} : réponse illisible, modèle suivant")
@@ -436,17 +559,34 @@ def analyser(a):
                 msg = str(e)
                 code = msg[:3]
                 if code in ("404", "400") and "API key" not in msg:
-                    # Modèle inexistant ou non autorisé : on le retire pour de bon
-                    print(f"   ❌ {modele} indisponible ({code}), retiré de la liste")
+                    print(f"   ❌ {modele} indisponible ({code}), retiré")
                     if modele in MODELES and len(MODELES) > 1:
                         MODELES.remove(modele)
+                elif code == "429":
+                    # Quota épuisé : inutile de le réessayer pendant ce run
+                    print(f"   🪫 {modele} : quota épuisé, retiré pour ce run")
+                    if modele in MODELES:
+                        MODELES.remove(modele)
+                    if not MODELES:
+                        print("   🪫 Plus aucun modèle Gemini disponible pour ce run")
+                        gemini_ok = False
+                        break
                 elif "API key" in msg or code in ("401", "403"):
                     print(f"   ⛔ Clé Gemini refusée : {msg[:150]}")
                     gemini_ok = False
                     break
                 else:
-                    print(f"   ⚠️ {modele} : {msg[:90]} -> modèle suivant")
-        if GROQ_MODELES:
+                    # Surcharge (503/504...) : on le passe en fin de liste
+                    print(f"   ⚠️ {modele} : {code} surcharge -> modèle suivant")
+                    if modele in MODELES and len(MODELES) > 1:
+                        MODELES.remove(modele)
+                        MODELES.append(modele)
+        if gemini_ok:
+            GEMINI_ECHECS += 1
+            if GEMINI_ECHECS >= GEMINI_ECHECS_MAX:
+                print("   🪫 Gemini échoue en boucle : désactivé pour ce run")
+                gemini_ok = False
+        if IA_PRINCIPALE != "groq" and GROQ_MODELES:
             res = analyser_groq(prompt)
             if isinstance(res, dict):
                 return res, True
@@ -458,21 +598,24 @@ def analyser(a):
     return None, False
 
 # ================= MESSAGE =================
-def formater(a, source, analyse=None):
+def formater(a, titre, infos=None):
     e = html.escape
-    lignes = [f"<b>🔥 {source}</b>", "",
+    lignes = [f"<b>🔥 {titre}</b>", "",
               f"📦 <b>{e(a['title'])}</b>",
-              f"💰 <b>{a['price']:.2f} €</b>"]
-    if analyse:
-        lignes.append(f"🧾 Coût total (protection + port) : {analyse['cout']} €")
-        lignes.append(f"📈 Revente estimée : ~{analyse.get('prix_revente', '?')} €")
-        lignes.append(f"💵 <b>Bénéfice net : +{analyse['benef']} € (ROI {analyse['roi']} %)</b>")
-        lignes.append(f"⭐ Revendabilité : {analyse.get('score', '?')}/10")
-        lignes.append(f"💡 {e(str(analyse.get('raison', '')))}")
+              f"💰 Prix Vinted : <b>{a['price']:.2f} €</b>"]
+    if infos:
+        lignes.append(f"📊 {infos['source']} : <b>{infos['ref']:.2f} €</b>"
+                      + (f" ({e(infos['carte'])})" if infos.get("carte") else ""))
+        lignes.append(f"📉 <b>-{infos['decote']} %</b> sous le prix du marché")
+        lignes.append(f"🧾 Coût total (protection + port) : {infos['cout']} €")
+        lignes.append(f"💵 <b>Bénéfice net estimé : +{infos['benef']} € (ROI {infos['roi']} %)</b>")
+        if infos.get("raison"):
+            lignes.append(f"💡 {e(str(infos['raison']))}")
     if a.get("status"):
         lignes.append(f"🏷️ État : {e(a['status'])}")
     if a.get("vendeur"):
         lignes.append(f"👤 {e(a['vendeur'])}")
+    lignes.append("⚠️ Vérifie le prix sur Cardmarket avant d'acheter.")
     return "\n".join(lignes)
 
 # ================= CYCLE =================
@@ -494,6 +637,7 @@ def cycle():
     alertes = 0
     a_reessayer = 0
     ia_en_panne = False
+    ia_dispo = bool(client or GROQ_MODELES)
     for a in nouvelles:
         if est_exclue(a):
             ids.append(a["id"])
@@ -502,39 +646,71 @@ def cycle():
         wl = match_watchlist(a)
         if wl:
             print(f"🎯 WATCHLIST '{wl[0]}' : {a['title']} — {a['price']} €")
-            if envoyer_telegram(formater(a, f"WATCHLIST : {wl[0]} ≤ {wl[1]} €"), a["photo"], a["url"]):
+            if envoyer_telegram(formater(a, f"WATCHLIST : {wl[0]} ≤ {wl[1]} €"),
+                                a["photo"], a["url"], a["title"]):
                 alertes += 1
             ids.append(a["id"])
             continue
 
-        if not client and not GROQ_MODELES:
-            ids.append(a["id"])
+        print(f"🔍 {a['title']} — {a['price']} €")
+        est_gradee = bool(GRADEE.search(a["title"]))
+        num_titre, total_titre = extraire_numero(a["title"])
+        res, ok, cm = {}, False, None
+
+        # 1) Carte avec numéro dans le titre -> prix Cardmarket direct, SANS IA
+        if num_titre and not est_gradee:
+            cm = prix_cardmarket(mots_du_titre(a["title"]), num_titre, total_titre,
+                                 "reverse" in a["title"].lower())
+            if cm:
+                print("   ⚡ Trouvée sur Cardmarket sans IA")
+
+        # 2) Sinon : IA pour identifier (Pokémon ? faux ? quelle carte ? quel prix ?)
+        if not cm and ia_dispo and not ia_en_panne:
+            r, ok = analyser(a)
+            time.sleep(PAUSE_GEMINI)
+            res = r if isinstance(r, dict) else {}
+            if not ok:
+                ia_en_panne = True
+                print("   💤 IA indisponible : les annonces sans numéro attendront le prochain run")
+            elif res.get("faux") or res.get("suspect") or res.get("pokemon") is False:
+                print(f"   🚫 écartée : {res.get('raison', '')}")
+                ids.append(a["id"])
+                continue
+            elif res.get("numero") and not est_gradee and res.get("type") not in ("gradee", "scelle"):
+                noms = [res.get("nom_fr"), res.get("nom_en")] + mots_du_titre(a["title"])
+                cm = prix_cardmarket(noms, str(res.get("numero")),
+                                     str(res.get("total") or total_titre or ""),
+                                     "reverse" in a["title"].lower())
+
+        numero = str(res.get("numero") or num_titre or "")
+        if cm:
+            ref, source = cm["prix"], "Prix Cardmarket"
+            carte = f"{cm['nom']} {numero} – {cm['set']}".strip()
+        elif ok:
+            try:
+                ref = float(res.get("prix_revente") or 0)
+            except (TypeError, ValueError):
+                ref = 0
+            source, carte = "Estimation IA (Cardmarket)", res.get("nom_fr") or ""
+        else:
+            # Ni IA ni Cardmarket : on réessaiera au prochain run
+            a_reessayer += 1
             continue
-        if ia_en_panne:
-            a_reessayer += 1  # gardée pour le prochain run
-            continue
-        print(f"🔍 IA : {a['title']} — {a['price']} €")
-        res, ok = analyser(a)
-        time.sleep(PAUSE_GEMINI)
-        if not ok or not isinstance(res, dict):
-            a_reessayer += 1  # pas mémorisée -> réanalysée au prochain run
-            ia_en_panne = True
-            print("   💤 IA indisponible : les annonces restantes seront analysées au prochain run")
-            continue
+
         ids.append(a["id"])
-        if res.get("suspect"):
-            print(f"   🚫 écartée : {res.get('raison', '')}")
+        if ref <= 0:
             continue
-        try:
-            score = int(res.get("score", 0))
-            revente = float(res.get("prix_revente", 0))
-        except (TypeError, ValueError):
-            continue
-        cout, benef, roi = calcul_rentabilite(a["price"], revente)
-        res.update(cout=cout, benef=benef, roi=roi)
-        print(f"   💶 revente ~{revente} € | bénéfice {benef} € | ROI {roi} % | score {score}")
-        if score >= SCORE_ALERTE and benef >= BENEF_MIN and roi >= ROI_MIN:
-            if envoyer_telegram(formater(a, "ACHAT-REVENTE RENTABLE", res), a["photo"], a["url"]):
+
+        decote = round((1 - a["price"] / ref) * 100)
+        cout, benef, roi = calcul_rentabilite(a["price"], ref)
+        print(f"   📊 {source} : {ref} € | -{decote} % | bénéfice {benef} € | ROI {roi} %")
+
+        if decote >= DECOTE_MIN and benef >= BENEF_MIN:
+            infos = {"source": source, "ref": ref, "carte": carte, "decote": decote,
+                     "cout": cout, "benef": benef, "roi": roi, "raison": res.get("raison")}
+            recherche = (cm or {}).get("nom") or res.get("nom_en") or res.get("nom_fr") or a["title"]
+            if envoyer_telegram(formater(a, f"BON PLAN : -{decote} % SOUS CARDMARKET", infos),
+                                a["photo"], a["url"], recherche):
                 alertes += 1
                 print("   ✅ Alerte envoyée")
 
