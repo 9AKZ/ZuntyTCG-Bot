@@ -116,8 +116,8 @@ VENDEUR_INCONNU_OK = False   # si les avis sont introuvables : pas d'alerte
 # États-Unis, Royaume-Uni, Canada... sont écartés.
 PAYS_AUTORISES = {"FR", "BE", "LU", "NL", "DE", "AT", "ES", "PT", "IT", "PL", "CZ", "SK",
                   "LT", "LV", "EE", "SE", "DK", "FI", "HU", "RO", "HR", "SI", "GR", "IE"}
-# Devises des pays autorisés (une annonce en dollars ou en livres = hors zone)
-DEVISES_OK = {"EUR", "PLN", "CZK", "SEK", "DKK", "HUF", "RON"}
+# Devises de pays où on ne peut pas acheter (dollars, livres, francs suisses...)
+DEVISES_INTERDITES = {"USD", "GBP", "CAD", "AUD", "CHF", "NZD"}
 DOMAINES_PAYS = {"vinted.fr": "FR", "vinted.be": "BE", "vinted.lu": "LU", "vinted.nl": "NL",
                  "vinted.de": "DE", "vinted.at": "AT", "vinted.es": "ES", "vinted.pt": "PT",
                  "vinted.it": "IT", "vinted.pl": "PL", "vinted.cz": "CZ", "vinted.sk": "SK",
@@ -373,7 +373,7 @@ def normaliser(item):
         "id": f"vinted_{item_id}",
         "title": item.get("title") or item.get("name") or "Sans titre",
         "price": extraire_prix(item),
-        "url": url or f"{WWW}/items/{item_id}",
+        "url": f"{WWW}/items/{item_id}",
         "photo": extraire_photo(item),
         "status": item.get("status") or item.get("item_condition") or "",
         "vendeur": user.get("login", "") if isinstance(user, dict) else "",
@@ -464,25 +464,28 @@ def jeu_de(a):
     """'onepiece' si l'annonce parle de One Piece, sinon 'pokemon'."""
     return "onepiece" if ONE_PIECE_INDICES.search(a["title"]) else "pokemon"
 
-def est_exclue(a):
+def raison_exclusion(a):
+    """Renvoie la raison pour laquelle l'annonce est écartée d'office, ou None."""
     titre = a["title"].lower()
     jeu = jeu_de(a)
     if jeu == "onepiece" and not ONE_PIECE_ACTIF:
-        return True
+        return "hors sujet"
     for m in MOTS_EXCLUS:
         # mot entier seulement : "carpe" n'exclut pas "Magicarpe", "métal" pas "Métalosse"
         if re.search(r"(?<![a-zà-ÿ])" + re.escape(m.strip()) + r"(?![a-zà-ÿ])", titre) \
                 and not (jeu == "onepiece" and m in MOTS_EXCLUS_OP_OK):
-            return True
+            return "hors sujet"
     if CARTES_FR_EN_SEULEMENT and (LANGUES_ETRANGERES.search(titre) or
                                    MOTS_AUTRES_LANGUES.search(titre)):
-        return True
-    # Vendeur d'un pays où on ne peut pas acheter depuis Vinted France
-    if a.get("devise") and a["devise"] not in DEVISES_OK:
-        return True
-    if a.get("pays_site") and a["pays_site"] not in PAYS_AUTORISES:
-        return True
-    return not (PRIX_MIN <= a["price"] <= PRIX_MAX)
+        return "langue"
+    if a.get("devise") in DEVISES_INTERDITES:
+        return "pays"
+    if not (PRIX_MIN <= a["price"] <= PRIX_MAX):
+        return "prix"
+    return None
+
+def est_exclue(a):
+    return raison_exclusion(a) is not None
 
 def match_watchlist(a):
     titre = a["title"].lower()
@@ -986,7 +989,7 @@ def verifier_annonce(a, scelle):
             return False, f"vendeur avec seulement {d['avis']} avis (arnaque probable)", d
         if d["note"] < VENDEUR_NOTE_MIN:
             return False, f"vendeur noté {d['note']}/5 seulement", d
-    pays = (d["pays"] or a.get("pays_site") or "").upper()
+    pays = (d["pays"] or "").upper()
     if pays and pays not in PAYS_AUTORISES:
         return False, f"vendeur situé dans un pays où on ne peut pas acheter ({pays})", d
     if not pays and langue_annonce(a) != "fr":
@@ -1058,9 +1061,21 @@ def formater_bilan(stats, top):
             else "pas de bon plan")
     lignes = [f"📋 <b>{periode}</b> · {etat}",
               f"🆕 {stats['nouvelles']} nouvelles · 📊 {stats['comparees']} comparées"
+              f" · 🔎 {sum(stats.get('exclusions', {}).values())} filtrées"
               f" · 🚫 {stats['ecartees']} écartées"
               + (f" · ⏳ {stats['attente']} en attente" if stats['attente'] else "")
               + (f"\n🛡️ {stats['refusees']} bloquée(s) par l'anti-arnaque" if stats.get('refusees') else "")]
+    excl = stats.get("exclusions") or {}
+    if excl:
+        noms = {"langue": "langue", "pays": "pays", "hors sujet": "hors sujet", "prix": "prix",
+                "non identifiable": "non identifiées"}
+        lignes.append("🔎 Filtres : " + " · ".join(f"{noms.get(k, k)} {v}" for k, v in
+                                                   sorted(excl.items(), key=lambda x: -x[1])))
+        total = stats["nouvelles"] or 1
+        if stats["comparees"] == 0 and stats["nouvelles"] >= 20:
+            pire = max(excl.items(), key=lambda x: x[1])
+            lignes.append(f"⚠️ <b>Anomalie</b> : aucune annonce comparée, le filtre « {pire[0]} » "
+                          f"en bloque {round(pire[1] * 100 / total)} %. Envoie les logs à ton assistant.")
     if top:
         lignes += [SEP, "🏆 <b>PODIUM</b>"]
         for medaille, (a, inf) in zip(["🥇", "🥈", "🥉"], top):
@@ -1099,18 +1114,21 @@ def cycle():
         print("ℹ️ Premier lancement : annonces mémorisées sans alerte.")
         sauvegarder_historique([a["id"] for a in nouvelles])
         return {"nouvelles": len(nouvelles), "comparees": 0, "ecartees": 0,
-                "attente": 0, "alertes": 0, "candidats": [], "refusees": 0}
+                "attente": 0, "alertes": 0, "candidats": [], "refusees": 0, "exclusions": {}}
 
     alertes = 0
     a_reessayer = 0
     ecartees = 0
+    exclusions = {}
     refusees = 0
     comparees = 0
     candidats = []  # (annonce, infos) de toutes les annonces comparées
     ia_en_panne = False
     ia_dispo = bool(client or GROQ_MODELES)
     for a in nouvelles:
-        if est_exclue(a):
+        raison = raison_exclusion(a)
+        if raison:
+            exclusions[raison] = exclusions.get(raison, 0) + 1
             ids.append(a["id"])
             continue
 
@@ -1183,7 +1201,13 @@ def cycle():
             ids.append(a["id"])
             continue
         else:
-            a_reessayer += 1  # ni IA ni Cardmarket : on réessaiera au prochain run
+            # ni IA ni Cardmarket : on réessaie aux 2 passages suivants, puis on abandonne
+            TENTATIVES[a["id"]] = TENTATIVES.get(a["id"], 0) + 1
+            if TENTATIVES[a["id"]] >= 3:
+                exclusions["non identifiable"] = exclusions.get("non identifiable", 0) + 1
+                ids.append(a["id"])
+            else:
+                a_reessayer += 1
             continue
 
         ids.append(a["id"])
@@ -1248,7 +1272,7 @@ def cycle():
 
     return {"nouvelles": len(nouvelles), "comparees": comparees, "ecartees": ecartees,
             "attente": a_reessayer, "alertes": alertes, "candidats": candidats,
-            "refusees": refusees}
+            "refusees": refusees, "exclusions": exclusions}
 
 def envoyer_bilan(stats):
     top = []
@@ -1290,7 +1314,11 @@ def sauvegarde_github():
         subprocess.run(c, capture_output=True, timeout=60)
     print("   💾 Historique sauvegardé sur GitHub")
 
+TENTATIVES = {}  # id annonce -> nombre d'essais sans pouvoir l'identifier
+
 def fusionner(total, st):
+    for k, v in st.get("exclusions", {}).items():
+        total["exclusions"][k] = total["exclusions"].get(k, 0) + v
     for k in ("nouvelles", "comparees", "ecartees", "alertes", "refusees"):
         total[k] += st[k]
     total["attente"] = st["attente"]
@@ -1298,7 +1326,7 @@ def fusionner(total, st):
 
 def stats_vides():
     return {"nouvelles": 0, "comparees": 0, "ecartees": 0, "attente": 0,
-            "alertes": 0, "candidats": [], "refusees": 0}
+            "alertes": 0, "candidats": [], "refusees": 0, "exclusions": {}}
 
 def main():
     parser = argparse.ArgumentParser()
