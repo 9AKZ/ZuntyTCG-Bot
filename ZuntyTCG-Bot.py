@@ -1,21 +1,31 @@
 """
-ZuntyTCG-Bot — détecteur de bons plans Pokémon sur Vinted.
+ZuntyTCG-Bot — chasseur de bonnes affaires Pokémon sur Vinted.
+
+Règle d'or : une alerte n'est envoyée que si
+  1. c'est une carte ou un produit scellé POKÉMON,
+  2. son VRAI prix Cardmarket est connu,
+  3. le prix Vinted est au moins DECOTE_MIN % en dessous,
+  4. il reste un bénéfice net après protection acheteurs, port et commission,
+  5. le vendeur est fiable (avis, note, pays où l'on peut acheter depuis Vinted France),
+  6. pour un produit scellé : "scellé" est écrit et ce n'est pas une boîte remplie de vrac.
 
 Usage :
-    python ZuntyTCG-Bot.py            -> un seul passage (GitHub Actions)
-    python ZuntyTCG-Bot.py --loop 90  -> tourne en continu, 1 passage toutes les 90 s (PC / Raspberry)
+    python ZuntyTCG-Bot.py                         -> un seul passage
+    python ZuntyTCG-Bot.py --loop 120 --duree 330  -> en continu (GitHub Actions)
 """
 import os
+import re
 import sys
 import json
 import time
 import html
 import random
-import re
 import argparse
+import subprocess
 import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import requests
 
 try:
@@ -24,43 +34,24 @@ try:
 except ImportError:
     pass
 
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except Exception:
+    genai = None
+    genai_types = None
 
-sys.stdout.reconfigure(line_buffering=True)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
-# ================= CONFIGURATION =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # secours gratuit : console.groq.com/keys
 
-# Ordre de préférence. Les autres modèles disponibles sur ton compte
-# sont ajoutés automatiquement à la suite au démarrage.
-MODELES_SECOURS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-]
-# IA utilisée en premier : "groq" (gratuit, gros quota) ou "gemini"
-IA_PRINCIPALE = os.getenv("IA_PRINCIPALE", "groq")
-GEMINI_ACTIF = True     # mets False pour ne plus du tout utiliser Gemini
-TOURS_MAX = 3           # nombre de tours complets sur tous les modèles
-GEMINI_ESSAIS_MAX = 4   # modèles Gemini essayés avant de passer à Groq
-PAUSE_TOUR = [5, 20, 45]  # attente (s) entre deux tours
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                        TES RÉGLAGES                              ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
-HISTORIQUE_FILE = "historique_vinted.json"
-TIMEOUT = (5, 15)
-
-# Recherches lancées à chaque passage
-# Recherches en français en priorité
+# Recherches Vinted (français en priorité)
 RECHERCHES = [
     "carte pokémon",
     "carte pokemon fr",
@@ -68,337 +59,307 @@ RECHERCHES = [
     "display pokémon",
     "etb pokémon",
     "coffret pokémon",
-    "carte pokémon gradée",
+    "bundle pokémon",
 ]
 
-# ===== ONE PIECE : uniquement les affaires EXTRÊMES, avec prix Cardmarket obligatoire =====
-ONE_PIECE_ACTIF = False   # désactivé : Pokémon uniquement
-RECHERCHES_ONE_PIECE = ["display one piece", "booster box one piece", "one piece card game scellé"]
-OP_DECOTE_MIN = 50      # au moins -50 % sous Cardmarket
-OP_BENEF_MIN = 25.0     # et au moins +25 € de bénéfice net
-
-# Cartes françaises ET anglaises uniquement : écarte les annonces qui précisent
-# une autre langue (japonais, chinois, coréen, allemand...)
-# Langues acceptées : FRANÇAIS, JAPONAIS et ANGLAIS. Tout le reste est écarté
-# (italien, espagnol, allemand, portugais, néerlandais, polonais, chinois, coréen...)
-CARTES_FR_EN_SEULEMENT = True
-LANGUES_ETRANGERES = re.compile(
-    r"\b(chinese|chinois|chinoise|korean|coreen|coréen|coréenne|kr|cn|s-chinese|t-chinese|"
-    r"german|allemand|allemande|deutsch|italian|italien|italienne|italiano|italiana|ita|"
-    r"spanish|espagnol|espagnole|español|espanol|esp|portugues|português|portugais|"
-    r"dutch|néerlandais|neerlandais|nederlands|polish|polonais|polski|thai|indonesian|"
-    r"indonésien)\b", re.I)
-# Mots typiques d'annonces rédigées dans une autre langue (titre écrit en italien, espagnol...)
-MOTS_AUTRES_LANGUES = re.compile(
-    r"\b(carta|cartas|nuovo|nuova|nuevo|nueva|novo|nova|sigillat[oaie]|sellad[oa]s?|selad[oa]|"
-    r"bustin[ae]|busta|caja|scatola|colección|coleccion|collezione|karte|karten|neu|"
-    r"versiegelt|sammlung|kaart|kaarten|nieuw|karta|karty|nowe|zapakowan[ey]|rzadk[aie])\b", re.I)
-
-# ===== PRIORITÉ AU FRANÇAIS =====
-# Les annonces en anglais ne sont signalées que si l'affaire est vraiment énorme,
-# et passent après les annonces françaises dans les podiums.
-ANGLAIS_DECOTE_MIN = 45      # -45 % minimum pour une annonce en anglais (au lieu de -30 %)
-MOTS_FR = {"carte", "cartes", "neuf", "neuve", "scellé", "scellée", "scelle", "coffret",
-           "français", "francais", "française", "francaise", "fr", "vf", "état", "etat",
-           "avec", "pour", "sous", "très", "tres", "bon", "rare", "rares", "dresseur",
-           "élite", "elite", "boîte", "boite", "jamais", "ouvert", "de", "du", "des", "le",
-           "la", "les", "et", "en", "vends", "vend", "collection"}
-MOTS_EN = {"card", "cards", "new", "sealed", "english", "eng", "en", "with", "the", "of",
-           "and", "mint", "brand", "lot", "box", "pack", "rare", "holo", "near", "trainer",
-           "bundle", "collection", "graded", "for", "sale", "unopened", "set", "complete"}
-
-# ===== ANTI-ARNAQUE =====
-# Vendeur : au moins 2 avis et une note moyenne d'au moins 4 étoiles
-VENDEUR_AVIS_MIN = 2
-VENDEUR_NOTE_MIN = 4.0
-VENDEUR_INCONNU_OK = False   # si les avis sont introuvables : pas d'alerte
-# Pays d'où on peut acheter depuis Vinted France (Union européenne, pas de douane).
-# États-Unis, Royaume-Uni, Canada... sont écartés.
-PAYS_AUTORISES = {"FR", "BE", "LU", "NL", "DE", "AT", "ES", "PT", "IT", "PL", "CZ", "SK",
-                  "LT", "LV", "EE", "SE", "DK", "FI", "HU", "RO", "HR", "SI", "GR", "IE"}
-# Devises de pays où on ne peut pas acheter (dollars, livres, francs suisses...)
-DEVISES_INTERDITES = {"USD", "GBP", "CAD", "AUD", "CHF", "NZD"}
-DOMAINES_PAYS = {"vinted.fr": "FR", "vinted.be": "BE", "vinted.lu": "LU", "vinted.nl": "NL",
-                 "vinted.de": "DE", "vinted.at": "AT", "vinted.es": "ES", "vinted.pt": "PT",
-                 "vinted.it": "IT", "vinted.pl": "PL", "vinted.cz": "CZ", "vinted.sk": "SK",
-                 "vinted.lt": "LT", "vinted.lv": "LV", "vinted.ee": "EE", "vinted.se": "SE",
-                 "vinted.dk": "DK", "vinted.fi": "FI", "vinted.hu": "HU", "vinted.ro": "RO",
-                 "vinted.hr": "HR", "vinted.si": "SI", "vinted.gr": "GR", "vinted.ie": "IE",
-                 "vinted.com": "US", "vinted.co.uk": "GB", "vinted.ca": "CA"}
-# Produits scellés (ETB, display, bundle...) : "scellé" doit être écrit
-# dans le titre ou la description, sinon pas d'alerte
-EXIGER_SCELLE = True
-MOTS_SCELLE_OK = re.compile(
-    r"(scell[ée]e?s?|sealed|sous blister|sous film|film[ée]e?s?|blister d'origine|"
-    r"(jamais|non|pas) ouverte?s?|neuf sous|factory|d'usine)", re.I)
-MOTS_OUVERT = re.compile(
-    r"(\bouverte?s?\b|d[ée]ball[ée]e?s?|\bopened\b|\bempty\b|\bvide\b|"
-    r"sans (les )?boosters?|box only|bo[iî]te seule|juste la bo[iî]te|sans cartes|"
-    r"bo[iî]te de rangement|pour ranger)", re.I)
-# Boîtes remplies de cartes en vrac ("ETB 151 + 500 rares") : écartées
-MOTS_LOT = re.compile(
-    r"(\b\d{2,5}\s*\+?\s*(cartes?|cards?|rares?|holos?|reverses?|communes?|brillantes?|"
-    r"pok[eé]mons?)\b|\+\s*\d+\s*(cartes?|cards?)|\blot\b|\bvrac\b|\bbulk\b|"
-    r"\brempli|\bavec (des |plein de )?cartes|\bclasseur|\bmystery|\bmyst[eè]re)", re.I)
-
-# Mode continu : bilan Telegram toutes les X minutes (au lieu de chaque passage)
-BILAN_TOUTES_LES_MIN = 30
+# Règle d'alerte
+DECOTE_MIN = 30             # % minimum sous le prix Cardmarket (français / japonais)
+ANGLAIS_DECOTE_MIN = 45     # % minimum pour une annonce en anglais
+BENEF_MIN = 3.0             # bénéfice net minimum en €
 
 # Watchlist : si le titre contient le mot ET que le prix est <= au max,
 # alerte dès qu'il y a un bénéfice (même sous la décote minimale).
-# Le prix Cardmarket est toujours vérifié avant.
 WATCHLIST = {
     "dracaufeu": 25,
     "charizard": 25,
     "display": 90,
     "etb": 35,
-    "psa 10": 60,
     "alternative": 30,
 }
 
-# Annonces ignorées directement (faux, recherches, accessoires...)
-MOTS_EXCLUS = [
-    "proxy", "fake", "custom", "réplique", "replica", "goldée", "metal", "métal",
-    "recherche", "cherche", "classeur vide", "sleeve", "protège", "pochette", "peluche",
-    "figurine", "jeu vidéo", "switch", "3ds", "fan art", "fanart", "mega construx",
-    "lego", "funko", "plush", "plushie", "sticker only",
-    # autres jeux / cartes de sport
-    "nfl", "nba", "panini", "topps", "upper deck", "football", "baseball", "basket",
-    "soccer", "one piece", "yu-gi-oh", "yugioh", "lorcana", "magic the gathering",
-    "dragon ball", "digimon", "leaf ",
-    # célébrités, autres licences, autres sports
-    "pêche", "peche", "leurre", "moulinet", "canne à", "carpe", "hameçon", "hamecon",
-    "appât", "appat", "fishing", "lure", "pêcheur", "pecheur", "mouche", "silure",
-    "trump", "biden", "macron", "président", "president", "elon", "wwe", "ufc", "f1 ",
-    "formule 1", "tennis", "rugby", "hockey", "nhl", "mlb", "marvel", "star wars",
-    "harry potter", "disney", "naruto", "dragon ball", "jujutsu", "demon slayer",
-]
-# (les mots "one piece" sont exclus pour Pokémon, mais gérés à part si ONE_PIECE_ACTIF)
-POKEMON_INDICES = re.compile(r"(pok[eé]mon|pkmn|\betb\b|elite trainer|coffret dresseur|"
-                             r"pok[eé]ball|pikachu|dracaufeu|charizard|evoli|évoli|eevee|mewtwo|"
-                             r"\bmew\b|ronflex|lucario|rayquaza|umbreon|noctali|gengar|ectoplasma)", re.I)
-ONE_PIECE_INDICES = re.compile(r"(one piece|\bop-?\s?\d{1,2}\b|\beb-?\s?\d{1,2}\b|\bprb-?\s?\d{1,2}\b|"
-                               r"romance dawn|luffy)", re.I)
-MOTS_EXCLUS_OP_OK = {"one piece"}
+PRIX_MIN = 2.0              # en dessous : arnaques / cartes sans valeur
+PRIX_MAX = 500.0            # au dessus : hors budget
 
-PRIX_MIN = 2.0          # en dessous : souvent des arnaques ou des cartes communes
-PRIX_MAX = 500.0        # au dessus : hors budget
-# ===== RÈGLE D'ALERTE =====
-# Alerte si : produit Pokémon + prix au moins DECOTE_MIN % sous le prix Cardmarket
-# + bénéfice net (après frais Vinted, port et commission) >= BENEF_MIN
-DECOTE_MIN = 30         # % minimum sous le prix Cardmarket
-# Un message Telegram à CHAQUE run : bilan + meilleure affaire trouvée,
-# même si elle n'atteint pas les seuils. Envoyé en mode silencieux
-# (pas de son) pour que seuls les vrais bons plans fassent sonner ton téléphone.
-RESUME_CHAQUE_RUN = True
-RESUME_SILENCIEUX = True
-BENEF_MIN = 3.0         # bénéfice net minimum en €
-
-# Coûts réels d'un achat Vinted (à ajuster si besoin)
-PROTECTION_FIXE = 0.70  # protection acheteurs : 0,70 € + 5 % du prix
+# Coûts réels
+PROTECTION_FIXE = 0.70      # protection acheteurs Vinted : 0,70 € + 5 % du prix
 PROTECTION_PCT = 0.05
-LIVRAISON = 3.50        # frais de port moyens à l'achat
-FRAIS_REVENTE_PCT = 0.05  # commission à la revente (Cardmarket ~5 %, Vinted 0 %)
-PAUSE_GEMINI = 4        # secondes entre deux appels (quota gratuit)
-ANALYSE_PHOTO = True    # envoie la photo à Gemini pour repérer les faux
+LIVRAISON_FRANCE = 3.50     # port moyen depuis un vendeur français
+LIVRAISON_EUROPE = 6.50     # port moyen depuis un autre pays européen
+FRAIS_REVENTE_PCT = 0.05    # commission à la revente (Cardmarket ~5 %, Vinted 0 %)
 
-# ================= GEMINI =================
-client = None
-MODELES = []
-EXCLUS_MODELES = ("tts", "image", "embedding", "live", "audio", "veo", "imagen",
-                  "banana", "aqa", "robotics", "computer-use", "native", "lyria")
+# Anti-arnaque
+VENDEUR_AVIS_MIN = 2        # au moins 2 avis...
+VENDEUR_NOTE_MIN = 4.0      # ...et une note moyenne d'au moins 4/5
+EXIGER_SCELLE = True        # produits scellés : "scellé" doit être écrit
+# Pays d'où l'on peut acheter depuis Vinted France (UE, sans douane)
+PAYS_AUTORISES = {"FR", "BE", "LU", "NL", "DE", "AT", "ES", "PT", "IT", "PL", "CZ", "SK",
+                  "LT", "LV", "EE", "SE", "DK", "FI", "HU", "RO", "HR", "SI", "GR", "IE"}
 
-def decouvrir_modeles():
-    """Liste de modèles à essayer : préférés d'abord, puis tous ceux du compte."""
-    ordre = [GEMINI_MODEL] + [m for m in MODELES_SECOURS if m != GEMINI_MODEL]
-    try:
-        dispo = []
-        for m in client.models.list():
-            nom = (m.name or "").replace("models/", "")
-            actions = getattr(m, "supported_actions", None) or []
-            if "gemini" not in nom or any(x in nom for x in EXCLUS_MODELES):
-                continue
-            if actions and "generateContent" not in actions:
-                continue
-            dispo.append(nom)
-        if dispo:
-            ordre = [m for m in ordre if m in dispo] + sorted(
-                (m for m in dispo if m not in ordre),
-                key=lambda n: ("flash" not in n, "preview" in n or "exp" in n, n))
-    except Exception as e:
-        print(f"⚠️ Liste des modèles indisponible ({e}), liste par défaut utilisée.")
-    return list(dict.fromkeys(ordre))
+# Telegram
+RESUME_CHAQUE_RUN = True    # bilan + podium même sans bon plan
+RESUME_SILENCIEUX = True    # bilans sans son (seules les alertes sonnent)
+BILAN_TOUTES_LES_MIN = 30   # en mode continu
 
-if GEMINI_API_KEY and GEMINI_ACTIF:
-    client = genai.Client(api_key=GEMINI_API_KEY,
-                          http_options=types.HttpOptions(timeout=45000))
-    MODELES = decouvrir_modeles()
-    print(f"🤖 Gemini actif : {len(MODELES)} modèles -> {', '.join(MODELES[:6])}"
-          + (" ..." if len(MODELES) > 6 else ""))
-else:
-    print("ℹ️ Gemini non utilisé (clé absente ou GEMINI_ACTIF = False).")
+# IA (sert à identifier les annonces, jamais à inventer un prix)
+IA_PRINCIPALE = os.getenv("IA_PRINCIPALE", "groq")   # "groq" ou "gemini"
+GEMINI_ACTIF = True
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-# ================= HISTORIQUE =================
-def charger_historique():
-    try:
-        with open(HISTORIQUE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [d["id"] if isinstance(d, dict) else d for d in data]
-    except Exception:
-        return []
+# Clés (dans les Secrets GitHub ou le fichier .env)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-def sauvegarder_historique(ids):
-    with open(HISTORIQUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(ids[-2000:], f, indent=2)
+# Technique
+HISTORIQUE_FILE = "historique_vinted.json"
+HISTORIQUE_MAX = 5000
+TIMEOUT = (5, 15)
+PARIS = ZoneInfo("Europe/Paris")
 
-# ================= TELEGRAM =================
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                     FILTRES & VOCABULAIRE                        ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+# Tout ce qui n'est pas une carte / un produit scellé Pokémon (mots entiers)
+MOTS_EXCLUS = [
+    # faux & fan-made
+    "proxy", "fake", "custom", "réplique", "replica", "goldée", "metal", "métal", "fan art",
+    "fanart", "orica",
+    # annonces de recherche
+    "recherche", "cherche",
+    # accessoires & goodies
+    "classeur", "binder", "portfolio", "sleeve", "sleeves", "protège", "protege", "pochette",
+    "toploader", "deck box", "tapis", "playmat", "peluche", "plush", "plushie", "figurine",
+    "figurines", "funko", "lego", "mega construx", "puzzle", "mug", "tasse", "poster",
+    "t-shirt", "tee-shirt", "sweat", "pull", "pyjama", "casquette", "chaussettes", "sac à dos",
+    "trousse", "lampe", "veilleuse", "déguisement", "costume", "manga", "livre", "dvd",
+    "sticker only",
+    # jeux vidéo
+    "jeu vidéo", "switch", "3ds", "nintendo ds", "game boy", "gameboy", "wii",
+    # pêche
+    "pêche", "peche", "leurre", "leurres", "moulinet", "canne à", "carpe", "hameçon", "hamecon",
+    "appât", "appat", "fishing", "lure", "lures", "pêcheur", "pecheur", "silure",
+    # autres jeux de cartes
+    "one piece", "yu-gi-oh", "yugioh", "lorcana", "magic the gathering", "mtg", "dragon ball",
+    "digimon", "naruto", "jujutsu", "demon slayer", "flesh and blood", "star wars", "marvel",
+    "disney", "harry potter",
+    # sport & célébrités
+    "nfl", "nba", "nhl", "mlb", "panini", "topps", "upper deck", "leaf", "football",
+    "baseball", "basket", "soccer", "tennis", "rugby", "hockey", "wwe", "ufc", "f1",
+    "formule 1", "trump", "biden", "macron", "président", "president", "elon",
+]
+EXCLUS_REGEX = re.compile(
+    r"(?<![a-zà-ÿ])(" + "|".join(re.escape(m) for m in MOTS_EXCLUS) + r")(?![a-zà-ÿ])", re.I)
+
+ONE_PIECE = re.compile(r"(\bop-?\s?\d{1,2}\b|\beb-?\s?\d{1,2}\b|romance dawn|\bluffy\b)", re.I)
+
+# Langues : FRANÇAIS, JAPONAIS et ANGLAIS uniquement
+LANGUES_INTERDITES = re.compile(
+    r"\b(chinese|chinois|chinoise|korean|coreen|coréen|coréenne|kr|cn|s-chinese|t-chinese|"
+    r"german|allemand|allemande|deutsch|italian|italien|italienne|italiano|italiana|ita|"
+    r"spanish|espagnol|espagnole|español|espanol|esp|portugues|português|portugais|"
+    r"dutch|néerlandais|neerlandais|nederlands|polish|polonais|polski|thai|indonesian|"
+    r"indonésien)\b", re.I)
+MOTS_AUTRES_LANGUES = re.compile(
+    r"\b(carta|cartas|nuovo|nuova|nuevo|nueva|novo|sigillat[oaie]|sellad[oa]s?|selad[oa]|"
+    r"bustin[ae]|busta|caja|scatola|colección|coleccion|collezione|karte|karten|neu|"
+    r"versiegelt|sammlung|kaart|kaarten|nieuw|karta|karty|nowe|zapakowan[ey]|rzadk[aie])\b",
+    re.I)
+JAPONAIS = re.compile(r"\b(jap|jp|japan|japanese|japonais|japonaise|japonaises)\b", re.I)
+MOTS_FR = {"carte", "cartes", "neuf", "neuve", "scelle", "coffret", "francais", "francaise",
+           "fr", "vf", "etat", "avec", "pour", "sous", "tres", "bon", "dresseur", "boite",
+           "jamais", "ouvert", "de", "du", "des", "le", "la", "les", "et", "vends", "vend"}
+MOTS_EN = {"card", "cards", "new", "sealed", "english", "eng", "with", "the", "of", "and",
+           "mint", "brand", "box", "pack", "near", "trainer", "graded", "for", "sale",
+           "unopened", "complete"}
+
+GRADEE = re.compile(r"\b(psa|cgc|bgs|pca|egc|beckett|collect aura|grad[ée]e?s?)\b", re.I)
+MOTS_SCELLES = re.compile(
+    r"\b(etb|elite trainer|coffret|display|booster|bundle|collection|upc|tin|pok[eé]box|"
+    r"blister|tripack|tri-pack|scell[ée]e?s?|sealed|premium|box)\b", re.I)
+MOTS_SCELLE_OK = re.compile(
+    r"(scell[ée]e?s?|sealed|sous blister|sous film|film[ée]e?s?|blister d'origine|"
+    r"(jamais|non|pas) ouverte?s?|neuf sous|factory|d'usine)", re.I)
+MOTS_OUVERT = re.compile(
+    r"(\bouverte?s?\b|d[ée]ball[ée]e?s?|\bopened\b|\bempty\b|\bvide\b|sans (les )?boosters?|"
+    r"box only|bo[iî]te seule|juste la bo[iî]te|sans cartes|bo[iî]te de rangement|pour ranger)",
+    re.I)
+MOTS_LOT = re.compile(
+    r"(\b\d{2,5}\s*\+?\s*(cartes?|cards?|rares?|holos?|reverses?|communes?|brillantes?|"
+    r"pok[eé]mons?)\b|\+\s*\d+\s*(cartes?|cards?)|\blot\b|\bvrac\b|\bbulk\b|\brempli|"
+    r"\bavec (des |plein de )?cartes|\bclasseur|\bmystery|\bmyst[eè]re)", re.I)
+
+DRAPEAUX = {"fr": "🇫🇷 ", "en": "🇬🇧 ", "ja": "🇯🇵 "}
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                            OUTILS                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def sans_accents(texte):
+    return unicodedata.normalize("NFKD", (texte or "").lower()).encode("ascii", "ignore").decode()
+
+def euros(x):
+    texte = f"{x:,.2f}".replace(",", " ").replace(".", ",")
+    return (texte[:-3] if texte.endswith(",00") else texte) + " €"
+
+def heure(ts=None):
+    return datetime.fromtimestamp(ts or time.time(), PARIS).strftime("%H:%M")
+
+def echapper(texte):
+    return html.escape(str(texte or ""), quote=False)
+
+def plus(dico, cle, n=1):
+    dico[cle] = dico.get(cle, 0) + n
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                            TELEGRAM                              ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
 def lien_cardmarket(recherche):
     return ("https://www.cardmarket.com/fr/Pokemon/Products/Search?searchString="
             + requests.utils.quote(recherche or ""))
 
-def envoyer_telegram(message, photo_url=None, lien=None, recherche_cm=None, silencieux=False,
-                     lignes_boutons=None):
+def envoyer_telegram(message, photo=None, boutons=None, silencieux=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Identifiants Telegram manquants.")
         return False
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    boutons = []
-    if lien:
-        boutons.append({"text": "🛒 Voir sur Vinted", "url": lien})
-    if recherche_cm:
-        boutons.append({"text": "📊 Cardmarket", "url": lien_cardmarket(recherche_cm)})
-    rangees = ([boutons] if boutons else []) + (lignes_boutons or [])
-    clavier = {"inline_keyboard": rangees} if rangees else None
-
-    def post(methode, payload):
-        if clavier:
-            payload["reply_markup"] = clavier
+    for _ in range(4):
+        if photo and len(message) <= 1024:
+            methode = "sendPhoto"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo, "caption": message,
+                       "parse_mode": "HTML"}
+        else:
+            methode = "sendMessage"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message[:4096], "parse_mode": "HTML",
+                       "disable_web_page_preview": True}
+        if boutons:
+            payload["reply_markup"] = {"inline_keyboard": boutons}
         if silencieux:
             payload["disable_notification"] = True
-        return requests.post(f"{base}/{methode}", json=payload, timeout=TIMEOUT)
-
-    try:
-        if photo_url and len(message) <= 1024:
-            r = post("sendPhoto", {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url,
-                                   "caption": message, "parse_mode": "HTML"})
+        try:
+            r = requests.post(f"{base}/{methode}", json=payload, timeout=TIMEOUT)
             if r.status_code == 200:
                 return True
-            print(f"   ⚠️ sendPhoto échoué ({r.status_code}), envoi en texte.")
-        r = post("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": message,
-                                 "parse_mode": "HTML", "disable_web_page_preview": False})
-        if r.status_code != 200:
-            print(f"   ⚠️ Erreur Telegram : {r.text}")
-        return r.status_code == 200
-    except Exception as e:
-        print(f"   ⚠️ Exception Telegram : {e}")
-        return False
+            if r.status_code == 429:  # trop de messages : on attend et on renvoie
+                attente = (r.json().get("parameters") or {}).get("retry_after", 5)
+                time.sleep(min(int(attente) + 1, 60))
+                continue
+            if methode == "sendPhoto":  # photo refusée : on renvoie en texte
+                photo = None
+                continue
+            print(f"   ⚠️ Telegram {r.status_code} : {r.text[:150]}")
+            return False
+        except Exception as e:
+            print(f"   ⚠️ Telegram : {str(e)[:80]}")
+            time.sleep(3)
+    return False
 
-# ================= VINTED (nouvelle API sept. 2026) =================
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                             VINTED                               ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
 WWW = "https://www.vinted.fr"
-API = "https://api.vinted.fr/svc-catalogue/items"
-
-HEADERS = {
+API_VINTED = "https://api.vinted.fr/svc-catalogue/items"
+ENTETES = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9",
 }
+SESSION = None
 
 def nouvelle_session():
     """Récupère le jeton anonyme que Vinted donne à tout visiteur."""
+    global SESSION
     s = requests.Session()
-    s.headers.update(HEADERS)
-    r = s.get(f"{WWW}/catalog", timeout=TIMEOUT,
-              headers={"Accept": "text/html,application/xhtml+xml"})
-    token = s.cookies.get("access_token_web")
-    anon_id = r.headers.get("x-anon-id") or s.cookies.get("anon_id")
+    s.headers.update(ENTETES)
+    r = s.get(f"{WWW}/catalog", timeout=TIMEOUT, headers={"Accept": "text/html"})
+    jeton = s.cookies.get("access_token_web")
+    anon = r.headers.get("x-anon-id") or s.cookies.get("anon_id")
     csrf = re.search(r'CSRF_TOKEN\\?"\s*:\s*\\?"([^"\\]+)', r.text)
-    print(f"🌐 Session Vinted : {r.status_code} | jeton : {'OK' if token else 'ABSENT'}")
-
+    print(f"🌐 Session Vinted : {r.status_code} | jeton : {'OK' if jeton else 'ABSENT'}")
     s.headers.update({"Accept": "application/json, text/plain, */*",
                       "Origin": WWW, "Referer": f"{WWW}/catalog"})
-    if token:
-        s.headers["Authorization"] = f"Bearer {token}"
-    if anon_id:
-        s.headers["X-Anon-Id"] = anon_id
+    if jeton:
+        s.headers["Authorization"] = f"Bearer {jeton}"
+    if anon:
+        s.headers["X-Anon-Id"] = anon
     if csrf:
         s.headers["X-Csrf-Token"] = csrf.group(1)
+    SESSION = s
     return s
 
-def devise_de(item):
+# --- Devises : Vinted affiche les prix dans la devise du VISITEUR (dollars depuis les
+# serveurs GitHub aux États-Unis). La devise ne dit rien du vendeur : on convertit.
+TAUX_SECOURS = {"USD": 0.86, "GBP": 1.16, "PLN": 0.235, "CZK": 0.040, "SEK": 0.090,
+                "DKK": 0.134, "HUF": 0.0025, "RON": 0.20, "CHF": 1.07, "CAD": 0.62}
+_taux = {}
+
+def taux_vers_euro(devise):
+    if not devise or devise == "EUR":
+        return 1.0
+    if devise not in _taux:
+        try:
+            r = requests.get("https://api.frankfurter.app/latest",
+                             params={"from": devise, "to": "EUR"}, timeout=TIMEOUT)
+            _taux[devise] = float(r.json()["rates"]["EUR"])
+        except Exception:
+            _taux[devise] = TAUX_SECOURS.get(devise, 1.0)
+        print(f"💱 Prix reçus en {devise} : convertis en euros (1 {devise} = {_taux[devise]:.3f} €)")
+    return _taux[devise]
+
+def _prix_brut(item):
     p = item.get("price")
+    devise = None
     if isinstance(p, dict):
-        return (p.get("currency_code") or "").upper() or None
-    return (item.get("currency") or "").upper() or None
-
-def pays_du_site(url):
-    """Pays du site Vinted de l'annonce. vinted.fr affiche aussi des vendeurs
-    d'autres pays : on ne s'en sert que pour repérer les sites étrangers (US, UK...)."""
-    m = re.search(r"https?://(?:www\.)?([a-z.]+?)/", url or "")
-    pays = DOMAINES_PAYS.get(m.group(1)) if m else None
-    return None if pays == "FR" else pays
-
-def extraire_prix(item):
-    p = item.get("price") or item.get("offers", {}).get("price")
-    if isinstance(p, dict):
+        devise = (p.get("currency_code") or "").upper() or None
         p = p.get("amount")
+    devise = devise or (item.get("currency") or "").upper() or None
     try:
-        return float(str(p).replace(",", "."))
+        return float(str(p).replace(",", ".")), devise
     except (TypeError, ValueError):
-        return 0.0
+        return 0.0, devise
 
-def extraire_photo(item):
-    photo = item.get("photo")
-    if not photo and item.get("photos"):
-        photo = item["photos"][0]
-    if not photo:
-        photo = item.get("image")
+def _photo(item):
+    photo = item.get("photo") or (item.get("photos") or [None])[0] or item.get("image")
     if isinstance(photo, list):
         photo = photo[0] if photo else None
     if isinstance(photo, dict):
         photo = photo.get("url") or photo.get("full_size_url") or photo.get("contentUrl")
-    return photo
+    return photo if isinstance(photo, str) else None
 
 def normaliser(item):
     url = item.get("url") or ""
-    if url.startswith("/"):
-        url = WWW + url
     item_id = item.get("id")
     if not item_id:
         m = re.search(r"/items/(\d+)", url)
         item_id = m.group(1) if m else None
     if not item_id:
         return None
-    user = item.get("user") or {}
+    prix, devise = _prix_brut(item)
+    user = item.get("user") if isinstance(item.get("user"), dict) else {}
+    statut = item.get("status") or item.get("item_condition") or ""
     return {
         "id": f"vinted_{item_id}",
-        "title": item.get("title") or item.get("name") or "Sans titre",
-        "price": extraire_prix(item),
-        "url": f"{WWW}/items/{item_id}",
-        "photo": extraire_photo(item),
-        "status": item.get("status") or item.get("item_condition") or "",
-        "vendeur": user.get("login", "") if isinstance(user, dict) else "",
-        "_user": user if isinstance(user, dict) else {},
-        "devise": devise_de(item),
-        "pays_site": pays_du_site(url),
+        "title": (item.get("title") or item.get("name") or "").strip(),
+        "price": round(prix * taux_vers_euro(devise), 2),
+        "url": f"{WWW}/items/{item_id}",      # toujours sur vinted.fr
+        "photo": _photo(item),
+        "status": statut if isinstance(statut, str) else "",
+        "vendeur": user.get("login", ""),
+        "_user": user,
     }
 
-def chercher_api(session, query):
-    r = session.get(API, timeout=TIMEOUT, params={
-        "search_text": query, "order": "newest_first", "page": 1,
-        "per_page": 30, "time": int(time.time()), "currency": "EUR"})
+def _chercher_page(s, query):
+    """Secours : annonces lues dans la page catalogue (JSON-LD)."""
+    r = s.get(f"{WWW}/catalog", timeout=TIMEOUT, headers={"Accept": "text/html"},
+              params={"search_text": query, "order": "newest_first"})
     if r.status_code != 200:
-        print(f"   ⚠️ API '{query}' -> {r.status_code} {r.text[:150]}")
-        return None
-    data = r.json()
-    return data.get("items") or data.get("catalog_items") or []
-
-def chercher_page(session, query):
-    """Secours : lit les annonces dans le JSON-LD de la page catalogue."""
-    r = session.get(f"{WWW}/catalog", timeout=TIMEOUT,
-                    params={"search_text": query, "order": "newest_first"},
-                    headers={"Accept": "text/html"})
-    if r.status_code != 200:
-        print(f"   ⚠️ Page '{query}' -> {r.status_code}")
         return []
     items = []
     for bloc in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', r.text, re.S):
@@ -407,210 +368,183 @@ def chercher_page(session, query):
         except ValueError:
             continue
         for d in (data if isinstance(data, list) else [data]):
-            for el in d.get("itemListElement", []) if isinstance(d, dict) else []:
-                items.append(el.get("item", el))
+            if isinstance(d, dict):
+                for el in d.get("itemListElement", []):
+                    items.append(el.get("item", el))
     return items
 
-SESSION_VINTED = None
-
 def recuperer_annonces():
-    global SESSION_VINTED
     try:
-        session = nouvelle_session()
-        SESSION_VINTED = session
+        s = nouvelle_session()
     except Exception as e:
-        print(f"⚠️ Impossible de joindre Vinted : {e}")
+        print(f"⚠️ Vinted injoignable : {str(e)[:80]}")
         return []
-
     annonces, vus = [], set()
-    for query in RECHERCHES + (RECHERCHES_ONE_PIECE if ONE_PIECE_ACTIF else []):
-        items = None
-        try:
-            items = chercher_api(session, query)
-            if items is None:
-                items = chercher_page(session, query)
-                print(f"   ↪️ secours page catalogue : {len(items)} annonces")
-        except Exception as e:
-            print(f"   ⚠️ '{query}' -> {e}")
-            items = []
+    for query in RECHERCHES:
+        items = []
+        for essai in range(2):
+            try:
+                r = s.get(API_VINTED, timeout=TIMEOUT, params={
+                    "search_text": query, "order": "newest_first", "page": 1, "per_page": 30,
+                    "time": int(time.time()), "currency": "EUR"})
+            except Exception as e:
+                print(f"   ⚠️ '{query}' : {str(e)[:60]}")
+                break
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get("items") or data.get("catalog_items") or []
+                break
+            if r.status_code == 401 and essai == 0:     # jeton expiré : on le renouvelle
+                s = nouvelle_session()
+                continue
+            if r.status_code in (403, 429):
+                print(f"   ⛔ Vinted limite les requêtes ({r.status_code}), pause de ce passage")
+                return annonces
+            print(f"   ⚠️ API '{query}' -> {r.status_code}, secours page catalogue")
+            try:
+                items = _chercher_page(s, query)
+            except Exception:
+                items = []
+            break
         print(f"📡 '{query}' : {len(items)} annonces")
         for item in items:
             a = normaliser(item)
-            if a and a["id"] not in vus:
+            if a and a["title"] and a["id"] not in vus:
                 vus.add(a["id"])
                 annonces.append(a)
-        time.sleep(1.5 + random.random())
+        time.sleep(1.2 + random.random())
     return annonces
 
-# ================= FILTRES =================
-def langue_annonce(a):
-    """'fr', 'ja', 'en' ou '?' d'après les mots du titre."""
-    titre = a["title"].lower()
-    if re.search(r"\b(jap|jp|japan|japanese|japonais|japonaise|japonaises)\b", titre) \
-            or re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", a["title"]):
-        return "ja"
-    if re.search(r"[éèêàçùûôî]", titre):
-        return "fr"
-    mots = set(re.findall(r"[a-z]+", titre))
-    fr = len(mots & (MOTS_FR - MOTS_EN))
-    en = len(mots & (MOTS_EN - MOTS_FR))
-    if fr > en:
-        return "fr"
-    if en > fr:
-        return "en"
-    return "?"
+# --- Détails d'une annonce : description + avis et pays du vendeur
+_details = {}
 
-def jeu_de(a):
-    """'onepiece' si l'annonce parle de One Piece, sinon 'pokemon'."""
-    return "onepiece" if ONE_PIECE_INDICES.search(a["title"]) else "pokemon"
+def _nombre(motif, texte, conv=float):
+    m = re.search(motif, texte)
+    try:
+        return conv(m.group(1)) if m else None
+    except ValueError:
+        return None
+
+def details_annonce(a):
+    if a["id"] in _details:
+        return _details[a["id"]]
+    u = a.get("_user") or {}
+    d = {"description": "", "avis": u.get("feedback_count"), "rep": u.get("feedback_reputation"),
+         "pays": u.get("country_iso_code") or u.get("country_code"), "lu": False}
+    s = SESSION or requests.Session()
+    try:
+        r = s.get(a["url"], timeout=TIMEOUT, headers={"Accept": "text/html,application/xhtml+xml"})
+        if r.status_code == 200:
+            d["lu"] = True
+            t = r.text
+            m = (re.search(r'property="og:description"[^>]*content="([^"]*)"', t) or
+                 re.search(r'content="([^"]*)"[^>]*property="og:description"', t))
+            d["description"] = html.unescape(m.group(1)) if m else ""
+            if not d["description"]:
+                m = re.search(r'\\?"description\\?":\s*\\?"(.{0,1500}?)\\?"', t)
+                d["description"] = m.group(1) if m else ""
+            if d["avis"] is None:
+                d["avis"] = _nombre(r'\\?"feedback_count\\?":\s*(\d+)', t, int)
+            if d["rep"] is None:
+                d["rep"] = _nombre(r'\\?"feedback_reputation\\?":\s*([\d.]+)', t)
+            if not d["pays"]:
+                m = re.search(r'\\?"country_iso_code\\?":\s*\\?"([A-Za-z]{2})', t)
+                d["pays"] = m.group(1) if m else None
+    except Exception:
+        pass
+    if (d["avis"] is None or not d["pays"]) and u.get("id"):
+        try:
+            r = s.get(f"{WWW}/api/v2/users/{u['id']}", timeout=TIMEOUT)
+            if r.status_code == 200:
+                uu = r.json().get("user", {})
+                d["avis"] = d["avis"] if d["avis"] is not None else uu.get("feedback_count")
+                d["rep"] = d["rep"] if d["rep"] is not None else uu.get("feedback_reputation")
+                d["pays"] = d["pays"] or uu.get("country_iso_code")
+                d["lu"] = True
+        except Exception:
+            pass
+    rep = d["rep"]
+    d["note"] = None if rep is None else (round(rep * 5, 1) if rep <= 1 else round(rep, 1))
+    d["pays"] = (d["pays"] or "").upper() or None
+    _details[a["id"]] = d
+    return d
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                       FILTRES D'ANNONCES                         ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def langue_annonce(a):
+    """'ja', 'fr', 'en' ou '?' d'après le titre."""
+    titre = a["title"]
+    if JAPONAIS.search(titre) or re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", titre):
+        return "ja"
+    if re.search(r"[éèêàçùûôî]", titre.lower()):
+        return "fr"
+    mots = set(re.findall(r"[a-z]+", sans_accents(titre)))
+    fr, en = len(mots & MOTS_FR), len(mots & MOTS_EN)
+    return "fr" if fr > en else "en" if en > fr else "?"
 
 def raison_exclusion(a):
-    """Renvoie la raison pour laquelle l'annonce est écartée d'office, ou None."""
-    titre = a["title"].lower()
-    jeu = jeu_de(a)
-    if jeu == "onepiece" and not ONE_PIECE_ACTIF:
+    """Raison pour laquelle l'annonce est écartée d'office, ou None."""
+    titre = a["title"]
+    if EXCLUS_REGEX.search(titre) or ONE_PIECE.search(titre):
         return "hors sujet"
-    for m in MOTS_EXCLUS:
-        # mot entier seulement : "carpe" n'exclut pas "Magicarpe", "métal" pas "Métalosse"
-        if re.search(r"(?<![a-zà-ÿ])" + re.escape(m.strip()) + r"(?![a-zà-ÿ])", titre) \
-                and not (jeu == "onepiece" and m in MOTS_EXCLUS_OP_OK):
-            return "hors sujet"
-    if CARTES_FR_EN_SEULEMENT and (LANGUES_ETRANGERES.search(titre) or
-                                   MOTS_AUTRES_LANGUES.search(titre)):
+    if LANGUES_INTERDITES.search(titre) or MOTS_AUTRES_LANGUES.search(titre):
         return "langue"
-    if a.get("devise") in DEVISES_INTERDITES:
-        return "pays"
     if not (PRIX_MIN <= a["price"] <= PRIX_MAX):
         return "prix"
+    if GRADEE.search(titre):
+        return "gradée (pas de prix Cardmarket)"
     return None
 
-def est_exclue(a):
-    return raison_exclusion(a) is not None
+def facteur_etat(statut):
+    """Décote selon l'état (le prix Cardmarket correspond à une carte parfaite)."""
+    s = sans_accents(statut)
+    if not s or "neuf" in s or "new" in s:
+        return 1.0
+    if "tres bon" in s or "very good" in s:
+        return 0.95
+    if "bon" in s or "good" in s:
+        return 0.80
+    if "satisfaisant" in s or "satisfactory" in s:
+        return 0.50
+    return 1.0
 
 def match_watchlist(a):
     titre = a["title"].lower()
     for mot, prix_max in WATCHLIST.items():
-        if mot in titre and a["price"] <= prix_max:
+        if re.search(r"\b" + re.escape(mot) + r"\b", titre) and a["price"] <= prix_max:
             return mot, prix_max
     return None
 
-# ================= GROQ (secours gratuit) =================
-GROQ_URL = "https://api.groq.com/openai/v1"
-GROQ_PREFERES = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b",
-                 "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
-GROQ_EXCLUS = ("whisper", "tts", "guard", "playai", "orpheus", "safeguard", "compound")
-GROQ_MODELES = []
 
-def decouvrir_groq():
-    if not GROQ_API_KEY:
-        return []
-    try:
-        r = requests.get(f"{GROQ_URL}/models", timeout=TIMEOUT,
-                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"})
-        dispo = [m["id"] for m in r.json().get("data", [])
-                 if m.get("active", True) and not any(x in m["id"] for x in GROQ_EXCLUS)]
-        if dispo:
-            return [m for m in GROQ_PREFERES if m in dispo] + sorted(
-                m for m in dispo if m not in GROQ_PREFERES)
-        print(f"⚠️ Groq : liste vide ({r.status_code}), liste par défaut utilisée.")
-    except Exception as e:
-        print(f"⚠️ Groq : liste indisponible ({e}), liste par défaut utilisée.")
-    return list(GROQ_PREFERES)
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║               PRIX CARDMARKET — CARTES (TCGdex)                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
-GROQ_MODELES = decouvrir_groq()
-if GROQ_MODELES:
-    print(f"🦙 Groq actif : {len(GROQ_MODELES)} modèles"
-          + (" (IA principale)" if IA_PRINCIPALE == "groq" else " (secours)"))
-
-def analyser_groq(prompt):
-    for modele in list(GROQ_MODELES):
-        try:
-            r = requests.post(f"{GROQ_URL}/chat/completions", timeout=(5, 40),
-                              headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                              json={"model": modele, "temperature": 0.2,
-                                    "response_format": {"type": "json_object"},
-                                    "messages": [{"role": "user", "content": prompt}]})
-            if r.status_code == 200:
-                texte = r.json()["choices"][0]["message"]["content"]
-                texte = texte.replace("```json", "").replace("```", "").strip()
-                res = json.loads(texte)
-                print(f"   🦙 Analysé par Groq ({modele})")
-                return res
-            if r.status_code in (400, 404) and modele in GROQ_MODELES and len(GROQ_MODELES) > 1:
-                GROQ_MODELES.remove(modele)
-                print(f"   ❌ Groq {modele} indisponible ({r.status_code}), retiré")
-            elif r.status_code == 429 and modele in GROQ_MODELES and len(GROQ_MODELES) > 1:
-                # quota atteint sur ce modèle : on le met en fin de liste
-                GROQ_MODELES.remove(modele)
-                GROQ_MODELES.append(modele)
-                print(f"   🪫 Groq {modele} : quota atteint -> modèle suivant")
-            else:
-                print(f"   ⚠️ Groq {modele} : {r.status_code} -> modèle suivant")
-        except Exception as e:
-            print(f"   ⚠️ Groq {modele} : {str(e)[:80]} -> modèle suivant")
-    return None
-
-# ================= ANALYSE IA =================
-PROMPT = """Nous sommes le {date}. Tu es un expert du marché français des cartes Pokémon
-(Cardmarket, eBay, Vinted).
-Analyse cette annonce Vinted :
-- Titre : {title}
-- Prix : {price} €
-- État : {status}
-
-Objectif : ACHAT-REVENTE. Estime le prix auquel cette annonce se REVEND réellement
-en France (prix de vente constatés sur Cardmarket et Vinted, pas les prix demandés),
-en tenant compte de l'état, de l'édition, de la langue et de la demande.
-Sois prudent : en cas de doute, estime bas.
-
-IMPORTANT : tes connaissances s'arrêtent avant aujourd'hui. De nouvelles séries,
-extensions, coffrets et promos sortent en permanence (ex : produits du 30e anniversaire
-Pokémon en 2026, séries Méga-Évolution, Légendes Z-A / Illumis-Lumiose...).
-Ne considère JAMAIS un produit comme faux uniquement parce que tu ne le connais pas.
-Pour un produit récent que tu ne connais pas, estime sa valeur d'après son type
-(display, ETB, coffret, carte ultra rare...) et mets un score plus bas.
-
-"faux": true UNIQUEMENT si signes clairs : "proxy", "fan art", "custom", "réplique",
-carte en métal/dorée non officielle, texte ou visuel visiblement faux sur la photo.
-"pokemon": false si ce n'est PAS un produit Pokémon TCG (autre jeu, carte de sport,
-jouet, Mega Construx, figurine...).
-
-Identifie aussi le produit le plus précisément possible.
-Réponds en JSON :
-{{"pokemon": true ou false, "faux": true ou false,
-  "type": "carte" ou "gradee" ou "scelle" ou "lot" ou "autre",
-  "nom_fr": "nom français de la carte ou du produit", "nom_en": "nom anglais",
-  "numero": "numéro de la carte ex 102 (vide si inconnu)",
-  "total": "total du set ex 128 (vide si inconnu)",
-  "prix_revente": prix Cardmarket FR estimé en euros,
-  "raison": "une phrase courte EN FRANÇAIS"}}
-Toutes tes réponses texte doivent être en français."""
-
-# ================= PRIX CARDMARKET (via TCGdex, gratuit) =================
 TCGDEX = "https://api.tcgdex.net/v2"
 _cache_tcgdex = {}
 MOTS_VIDES = {
-    "carte", "cartes", "pokemon", "pokémon", "holo", "reverse", "rare", "ultra", "secret",
-    "full", "art", "alternative", "alt", "promo", "neuf", "mint", "near", "lot", "card",
-    "cards", "francaise", "française", "francais", "français", "anglaise", "japonaise",
-    "fr", "eng", "en", "jp", "jap", "vf", "etat", "état", "tbe", "be", "tcg", "set", "the",
-    "and", "les", "des", "une", "avec", "pour", "edition", "édition", "illustration",
+    "carte", "cartes", "pokemon", "holo", "reverse", "rare", "ultra", "secret", "full", "art",
+    "alternative", "alt", "promo", "neuf", "neuve", "mint", "near", "lot", "card", "cards",
+    "francaise", "francais", "anglaise", "japonaise", "etat", "tbe", "tcg", "set", "the",
+    "and", "les", "des", "une", "avec", "pour", "edition", "illustration", "vends", "vend",
+    "brillante", "officielle", "originale", "authentique",
 }
-GRADEE = re.compile(r"\b(psa|cgc|bgs|pca|egc|beckett|collect aura|grad[ée]e?)\b", re.I)
 
 def tcgdex_get(chemin, params=None):
     cle = (chemin, tuple(sorted((params or {}).items())))
-    if cle in _cache_tcgdex:
-        return _cache_tcgdex[cle]
-    data = None
-    try:
-        r = requests.get(f"{TCGDEX}/{chemin}", params=params, timeout=TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-    except Exception:
-        pass
-    _cache_tcgdex[cle] = data
-    return data
+    if cle not in _cache_tcgdex:
+        data = None
+        try:
+            r = requests.get(f"{TCGDEX}/{chemin}", params=params, timeout=TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+        except Exception:
+            pass
+        _cache_tcgdex[cle] = data
+    return _cache_tcgdex[cle]
 
 def extraire_numero(titre):
     m = re.search(r"\b([A-Za-z]{0,4}\d{1,3})\s*/\s*([A-Za-z]{0,4}\d{1,3})\b", titre)
@@ -618,143 +552,159 @@ def extraire_numero(titre):
 
 def mots_du_titre(titre):
     mots = re.findall(r"[A-Za-zÀ-ÿ\-']{3,}", titre)
-    return [m for m in mots if m.lower() not in MOTS_VIDES][:4]
+    return [m for m in mots if sans_accents(m) not in MOTS_VIDES][:3]
 
-def prix_cardmarket(noms, numero, total, reverse=False):
-    """Cherche la carte sur TCGdex et renvoie le prix Cardmarket (tendance)."""
+def prix_carte(noms, numero, total, reverse=False):
+    """Carte exacte (nom + numéro + total du set) -> prix tendance Cardmarket."""
     numero = (numero or "").strip()
     if not numero:
         return None
     variantes = {numero, numero.lstrip("0") or "0"}
     if numero.isdigit():
         variantes.add(numero.zfill(3))
-    filtre_num = "eq:" + "|".join(sorted(variantes))
-    total_int = int(re.sub(r"\D", "", total)) if re.sub(r"\D", "", total or "") else None
-
+    filtre = "eq:" + "|".join(sorted(variantes))
+    chiffres = re.sub(r"\D", "", total or "")
+    total_int = int(chiffres) if chiffres else None
+    deja = set()
     for langue in ("fr", "en"):
-        for nom in [n for n in noms if n][:5]:
-            res = tcgdex_get(f"{langue}/cards", {"name": nom, "localId": filtre_num})
+        for nom in [n for n in noms if n][:4]:
+            mot = sans_accents(nom)
+            if (langue, mot) in deja:
+                continue
+            deja.add((langue, mot))
+            res = tcgdex_get(f"{langue}/cards", {"name": nom, "localId": filtre})
             if not isinstance(res, list):
                 continue
-            mot = unicodedata.normalize("NFKD", nom.lower()).encode("ascii", "ignore").decode()
-            for brief in res[:6]:
-                nom_carte = unicodedata.normalize("NFKD", (brief.get("name") or "").lower()) \
-                    .encode("ascii", "ignore").decode()
+            for brief in res[:5]:
+                nom_carte = sans_accents(brief.get("name"))
                 if mot not in re.findall(r"[a-z0-9]+", nom_carte) and mot != nom_carte:
-                    continue  # "like" trop large : on veut le mot exact dans le nom
+                    continue   # on veut le mot exact dans le nom de la carte
                 carte = tcgdex_get(f"{langue}/cards/{brief.get('id')}")
                 if not isinstance(carte, dict):
                     continue
-                nb = ((carte.get("set") or {}).get("cardCount") or {})
+                nb = (carte.get("set") or {}).get("cardCount") or {}
                 if total_int and total_int not in (nb.get("official"), nb.get("total")):
                     continue
                 cm = (carte.get("pricing") or {}).get("cardmarket") or {}
-                if reverse:
-                    ref = cm.get("trend-holo") or cm.get("avg30-holo") or cm.get("avg-holo")
-                else:
-                    ref = None
+                ref = (cm.get("trend-holo") or cm.get("avg30-holo")) if reverse else None
                 ref = ref or cm.get("trend") or cm.get("avg30") or cm.get("avg")
-                if ref:
-                    return {"prix": round(float(ref), 2), "nom": carte.get("name"),
-                            "set": (carte.get("set") or {}).get("name", ""),
-                            "id": carte.get("id")}
+                if not ref:
+                    continue
+                en = tcgdex_get(f"en/cards/{carte.get('id')}") if langue == "fr" else carte
+                return {"prix": round(float(ref), 2), "nom": carte.get("name"),
+                        "nom_en": (en or {}).get("name") or carte.get("name"),
+                        "set": (carte.get("set") or {}).get("name", ""), "scelle": False}
     return None
 
-# ================= PRIX CARDMARKET DES PRODUITS SCELLÉS =================
-# Guide de prix officiel publié chaque jour par Cardmarket (gratuit, sans clé)
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║        PRIX CARDMARKET — PRODUITS SCELLÉS (guide officiel)       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
 CM_CATALOGUE = "https://downloads.s3.cardmarket.com/productCatalog"
-MOTS_SCELLES = re.compile(r"\b(etb|elite trainer|display|booster box|booster bundle|bundle|"
-                          r"coffret|collection|upc|tin|pok[eé]ball tin|blister|tripack|"
-                          r"tri-pack|booster|scell[ée]|sealed|premium|box)\b", re.I)
 ABREVIATIONS = [
-    (r"\betb\b", "elite trainer box"), (r"\bdisplay\b", "booster box"),
-    (r"\bupc\b", "ultra premium collection"), (r"\btri-?pack\b", "3 pack blister"),
-    (r"\bcoffret dresseur d'?elite\b", "elite trainer box"),
+    (r"\bcoffret dresseur d'?\s?elite\b", "elite trainer box"),
+    (r"\betb\b", "elite trainer box"),
+    (r"\bdisplay\b", "booster box"),
+    (r"\bupc\b", "ultra premium collection"),
+    (r"\bcoffret ultra premium\b", "ultra premium collection"),
+    (r"\bcoffret premium\b", "premium collection"),
+    (r"\btri-?pack\b", "3 pack blister"),
+    (r"\bmini pokebox\b", "mini tin"),
+    (r"\bpokebox\b", "tin"),
 ]
-MOTS_VIDES_EN = {"pokemon", "tcg", "scelle", "sealed", "neuf", "new", "fr", "en", "eng",
-                 "francais", "anglais", "english", "french", "the", "de", "la", "le", "et",
-                 "a", "vendre", "pour", "avec", "of", "and", "edition", "version", "set"}
-_catalogues = {}          # jeu -> liste de produits
-ID_JEU_CARDMARKET = {"pokemon": [6], "onepiece": [18, 19, 20, 21, 22, 17]}
-SIGNATURE_JEU = {"onepiece": ("romance dawn", "paramount war", "pillars of strength",
-                              "kingdoms of intrigue", "awakening of the new era")}
-
-def jetons(texte):
-    t = unicodedata.normalize("NFKD", texte.lower()).encode("ascii", "ignore").decode()
-    for motif, remplacement in ABREVIATIONS:
-        t = re.sub(motif, remplacement, t)
-    t = re.sub(r"\b(op|eb|st|prb)\s*-?\s*(\d{1,2})\b",
-               lambda m: f"{m.group(1)}{int(m.group(2)):02d}", t)
-    return [w for w in re.findall(r"[a-z0-9]+", t) if w not in MOTS_VIDES_EN]
-
-def charger_catalogue_scelle(jeu="pokemon"):
-    """Télécharge (1 fois par run) le guide de prix Cardmarket des produits scellés."""
-    if jeu in _catalogues:
-        return _catalogues[jeu]
-    _catalogues[jeu] = []
-    for id_jeu in ID_JEU_CARDMARKET.get(jeu, []):
-        try:
-            prods = requests.get(f"{CM_CATALOGUE}/productList/products_nonsingles_{id_jeu}.json",
-                                 timeout=(5, 60)).json().get("products", [])
-            if jeu in SIGNATURE_JEU:
-                noms = " ".join(p.get("name", "").lower() for p in prods[:5000])
-                if not any(sig in noms for sig in SIGNATURE_JEU[jeu]):
-                    continue  # ce n'est pas le bon jeu, on essaie l'identifiant suivant
-            guide = requests.get(f"{CM_CATALOGUE}/priceGuide/price_guide_{id_jeu}.json",
-                                 timeout=(5, 90)).json().get("priceGuides", [])
-            prix = {g.get("idProduct"): g for g in guide}
-            for pr in prods:
-                g = prix.get(pr.get("idProduct"))
-                ref = g and (g.get("trend") or g.get("avg30") or g.get("avg"))
-                if ref and pr.get("name"):
-                    _catalogues[jeu].append((set(jetons(pr["name"])), pr["name"], float(ref)))
-            print(f"   📦 Guide de prix Cardmarket ({jeu}) chargé : {len(_catalogues[jeu])} produits")
-            break
-        except Exception as e:
-            print(f"   ⚠️ Guide de prix Cardmarket ({jeu}) indisponible : {str(e)[:80]}")
-    return _catalogues[jeu]
-
+MOTS_VIDES_EN = {"pokemon", "tcg", "scelle", "scellee", "sealed", "neuf", "neuve", "new", "fr",
+                 "en", "eng", "francais", "francaise", "anglais", "english", "french", "the",
+                 "de", "la", "le", "et", "a", "vendre", "pour", "avec", "of", "and", "edition",
+                 "version", "set", "jap", "jp", "japonais", "japonaise"}
 MOTS_TYPE = {"booster", "box", "elite", "trainer", "bundle", "collection", "premium", "ultra",
              "pack", "blister", "tin", "mini", "deck", "starter", "double", "case", "3",
-             "build", "battle", "display", "sleeved", "half", "art"}
-MOTS_SERIE = {"scarlet", "violet", "sword", "shield", "sun", "moon", "black", "white",
-              "xy", "sv", "swsh", "sm", "one", "piece", "card", "game"}
+             "build", "battle", "display", "sleeved", "half"}
+MOTS_SERIE = {"scarlet", "violet", "sword", "shield", "sun", "moon", "black", "white", "xy",
+              "sv", "swsh", "sm", "mega", "evolution"}
+LANGUES_PRODUIT = {"japanese": "ja", "korean": "ko", "chinese": "zh", "thai": "th",
+                   "indonesian": "id", "german": "de", "french": "fr", "italian": "it",
+                   "spanish": "es", "portuguese": "pt"}
+_catalogue = None
+_sets_fr = None
+
+def jetons(texte):
+    t = sans_accents(texte)
+    for motif, remplacement in ABREVIATIONS:
+        t = re.sub(motif, remplacement, t)
+    return [w for w in re.findall(r"[a-z0-9]+", t) if w not in MOTS_VIDES_EN]
+
+def sets_en_vers_fr():
+    """Noms d'extensions anglais -> français (via TCGdex)."""
+    global _sets_fr
+    if _sets_fr is None:
+        _sets_fr = {}
+        fr = {x.get("id"): x.get("name") for x in (tcgdex_get("fr/sets") or []) if isinstance(x, dict)}
+        for x in tcgdex_get("en/sets") or []:
+            if isinstance(x, dict) and x.get("name") and fr.get(x.get("id")):
+                _sets_fr[x["name"].lower()] = fr[x["id"]]
+    return _sets_fr
 
 def fr_vers_en(texte):
-    """Remplace les noms d'extensions français par leur nom anglais (pour Cardmarket)."""
-    t = unicodedata.normalize("NFKD", texte.lower()).encode("ascii", "ignore").decode()
+    """Remplace les noms d'extensions français par les noms anglais de Cardmarket."""
+    t = sans_accents(texte)
     for en, fr in sorted(sets_en_vers_fr().items(), key=lambda x: -len(x[1])):
-        f = unicodedata.normalize("NFKD", fr.lower()).encode("ascii", "ignore").decode()
+        f = sans_accents(fr)
         if len(f) > 3 and f in t:
             t = t.replace(f, en)
     return t
 
-def prix_scelle(requete, jeu="pokemon"):
-    """Trouve le produit scellé Cardmarket correspondant à la requête.
-    Le produit doit avoir TOUS ses mots de type (display, ETB...) dans la requête
-    et la majorité de ses mots d'extension."""
+def charger_catalogue():
+    """Guide de prix Cardmarket des produits scellés Pokémon (1 fois par session)."""
+    global _catalogue
+    if _catalogue is not None:
+        return _catalogue
+    _catalogue = []
+    try:
+        produits = requests.get(f"{CM_CATALOGUE}/productList/products_nonsingles_6.json",
+                                timeout=(5, 60)).json().get("products", [])
+        guide = requests.get(f"{CM_CATALOGUE}/priceGuide/price_guide_6.json",
+                             timeout=(5, 90)).json().get("priceGuides", [])
+        prix = {g.get("idProduct"): g for g in guide}
+        for p in produits:
+            g = prix.get(p.get("idProduct"))
+            ref = g and (g.get("trend") or g.get("avg30") or g.get("avg"))
+            if ref and p.get("name"):
+                toks = set(jetons(p["name"]))
+                langue = next((v for k, v in LANGUES_PRODUIT.items() if k in toks), "")
+                _catalogue.append((toks, p["name"], float(ref), langue))
+        print(f"   📦 Guide de prix Cardmarket chargé : {len(_catalogue)} produits scellés")
+    except Exception as e:
+        print(f"   ⚠️ Guide de prix Cardmarket indisponible : {str(e)[:80]}")
+    return _catalogue
+
+def prix_scelle(requete, langue_annonce_):
+    """Produit scellé Cardmarket correspondant : tous ses mots de type (display, ETB...)
+    et la majorité de ses mots d'extension doivent être dans la requête."""
     if not requete:
         return None
-    q = set(jetons(fr_vers_en(requete) if jeu == "pokemon" else requete))
-    meilleur, meilleur_score = None, 0
-    for toks, nom, ref in charger_catalogue_scelle(jeu):
+    q = set(jetons(fr_vers_en(requete)))
+    langue_voulue = "ja" if langue_annonce_ == "ja" else ""
+    meilleur, score_max = None, 0
+    for toks, nom, ref, langue in charger_catalogue():
+        if langue != langue_voulue and not (langue == "fr" and langue_voulue == ""):
+            continue   # un display japonais n'a pas le prix d'un display français
         types_p = toks & MOTS_TYPE
-        set_p = toks - MOTS_TYPE - MOTS_SERIE
-        types_requis = types_p - {"booster"} if "bundle" in types_p else types_p
-        if not types_p or not set_p or not types_requis <= q:
+        set_p = toks - MOTS_TYPE - MOTS_SERIE - set(LANGUES_PRODUIT)
+        requis = types_p - {"booster"} if "bundle" in types_p else types_p
+        if not types_p or not set_p or not requis <= q:
             continue
         communs = set_p & q
         if not communs or len(communs) / len(set_p) < 0.6:
             continue
         score = len(communs) + len(types_p) - 0.1 * len(set_p - q)
-        if score > meilleur_score:
-            meilleur, meilleur_score = (nom, ref), score
-    if meilleur:
-        return {"prix": round(meilleur[1], 2), "nom": meilleur[0], "set": "", "scelle": True,
-                "nom_fr": traduire_produit(meilleur[0])}
-    return None
+        if score > score_max:
+            meilleur, score_max = (nom, ref), score
+    if not meilleur:
+        return None
+    return {"prix": round(meilleur[1], 2), "nom": traduire_produit(meilleur[0]),
+            "nom_en": meilleur[0], "set": "", "scelle": True}
 
-# ================= TRADUCTION EN FRANÇAIS =================
 TYPES_FR = [
     ("ultra premium collection", "Coffret Ultra Premium"),
     ("elite trainer box case", "Carton de Coffrets Dresseur d'Élite"),
@@ -766,27 +716,12 @@ TYPES_FR = [
     ("premium collection", "Coffret Premium"),
     ("3 pack blister", "Tripack"),
     ("mini tin", "Mini Pokébox"),
-    ("starter deck", "Deck de démarrage"),
-    ("double pack", "Double pack"),
     ("collection box", "Coffret"),
     ("collection", "Coffret"),
     ("blister", "Blister"),
     ("booster", "Booster"),
     ("tin", "Pokébox"),
 ]
-_sets_fr = None
-
-def sets_en_vers_fr():
-    """Noms des extensions Pokémon anglais -> français (via TCGdex)."""
-    global _sets_fr
-    if _sets_fr is None:
-        _sets_fr = {}
-        en = tcgdex_get("en/sets") or []
-        fr = {x.get("id"): x.get("name") for x in (tcgdex_get("fr/sets") or [])}
-        for x in en:
-            if x.get("name") and fr.get(x.get("id")):
-                _sets_fr[x["name"].lower()] = fr[x["id"]]
-    return _sets_fr
 
 def traduire_produit(nom):
     """'Prismatic Evolutions Booster Box' -> 'Display Évolutions Prismatiques'."""
@@ -801,219 +736,232 @@ def traduire_produit(nom):
             reste = (nom[:m.start()] + nom[m.end():]).strip(" -:")
             break
     for en, fr in sorted(sets_en_vers_fr().items(), key=lambda x: -len(x[0])):
-        if en and en in reste.lower():
-            i = reste.lower().find(en)
+        i = reste.lower().find(en)
+        if en and i >= 0:
             reste = reste[:i] + fr + reste[i + len(en):]
             break
     return f"{type_fr} {reste}".strip() if type_fr else reste
 
-def calcul_rentabilite(prix, prix_revente):
-    cout = prix + PROTECTION_FIXE + prix * PROTECTION_PCT + LIVRAISON
-    net_revente = prix_revente * (1 - FRAIS_REVENTE_PCT)
-    benef = net_revente - cout
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║           IA : IDENTIFIER L'ANNONCE (Groq puis Gemini)           ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class IA:
+    """Identifie une annonce (Pokémon ? faux ? quelle carte / quel produit ?).
+    Essaie tous les modèles Groq puis Gemini, et ne donne JAMAIS de prix."""
+    GROQ_URL = "https://api.groq.com/openai/v1"
+    GROQ_PREFERES = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                     "llama-3.1-8b-instant"]
+    GROQ_EXCLUS = ("whisper", "tts", "guard", "playai", "orpheus", "safeguard", "compound")
+    GEMINI_PREFERES = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash",
+                       "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest",
+                       "gemini-flash-lite-latest"]
+    GEMINI_EXCLUS = ("tts", "image", "embedding", "live", "audio", "veo", "imagen", "banana",
+                     "aqa", "robotics", "computer-use", "native", "lyria", "transcribe")
+
+    def __init__(self):
+        self.groq_init = self._modeles_groq()
+        self.client = None
+        self.gemini_init = []
+        if GEMINI_ACTIF and GEMINI_API_KEY and genai:
+            try:
+                self.client = genai.Client(api_key=GEMINI_API_KEY,
+                                           http_options=genai_types.HttpOptions(timeout=45000))
+                self.gemini_init = self._modeles_gemini()
+            except Exception as e:
+                print(f"⚠️ Gemini indisponible : {str(e)[:80]}")
+        self.reinitialiser()
+        print(f"🦙 Groq : {len(self.groq_init)} modèles | 🤖 Gemini : {len(self.gemini_init)} modèles"
+              f" | IA principale : {IA_PRINCIPALE}")
+
+    def reinitialiser(self):
+        """Recharge les quotas (appelé toutes les 30 min)."""
+        self.groq = list(self.groq_init)
+        self.gemini = list(self.gemini_init)
+        self.en_panne = False
+
+    @property
+    def dispo(self):
+        return bool(self.groq or self.gemini)
+
+    def _modeles_groq(self):
+        if not GROQ_API_KEY:
+            return []
+        try:
+            r = requests.get(f"{self.GROQ_URL}/models", timeout=TIMEOUT,
+                             headers={"Authorization": f"Bearer {GROQ_API_KEY}"})
+            dispo = [m["id"] for m in r.json().get("data", [])
+                     if m.get("active", True) and not any(x in m["id"] for x in self.GROQ_EXCLUS)]
+            if dispo:
+                return [m for m in self.GROQ_PREFERES if m in dispo] + sorted(
+                    m for m in dispo if m not in self.GROQ_PREFERES)
+        except Exception:
+            pass
+        return list(self.GROQ_PREFERES)
+
+    def _modeles_gemini(self):
+        ordre = [GEMINI_MODEL] + [m for m in self.GEMINI_PREFERES if m != GEMINI_MODEL]
+        try:
+            dispo = []
+            for m in self.client.models.list():
+                nom = (m.name or "").replace("models/", "")
+                actions = getattr(m, "supported_actions", None) or []
+                if "gemini" in nom and "flash" in nom and not any(x in nom for x in self.GEMINI_EXCLUS) \
+                        and (not actions or "generateContent" in actions):
+                    dispo.append(nom)
+            if dispo:
+                ordre = [m for m in ordre if m in dispo] + sorted(m for m in dispo if m not in ordre)
+        except Exception:
+            pass
+        return list(dict.fromkeys(ordre))
+
+    @staticmethod
+    def prompt(a):
+        return (
+            f"Nous sommes le {time.strftime('%d/%m/%Y')}. Tu es expert des cartes Pokémon (TCG).\n"
+            f"Annonce Vinted :\n- Titre : {a['title']}\n- Prix : {a['price']} €\n"
+            f"- État : {a.get('status') or 'inconnu'}\n\n"
+            "Tes connaissances s'arrêtent avant aujourd'hui : de nouvelles séries sortent en "
+            "permanence (Méga-Évolution, 30e anniversaire en 2026...). Ne juge JAMAIS un produit "
+            "faux simplement parce que tu ne le connais pas.\n\n"
+            "Réponds uniquement en JSON avec ces clés :\n"
+            '"pokemon": true si c\'est une carte ou un produit scellé Pokémon TCG, false sinon '
+            "(autre jeu, sport, jouet, peluche, figurine, vêtement, pêche...) ;\n"
+            '"faux": true UNIQUEMENT si signes clairs de contrefaçon (proxy, fan art, custom, '
+            "carte en métal/dorée non officielle) ;\n"
+            '"type": "carte", "scelle", "lot" ou "autre" ;\n'
+            '"nom_fr": nom français de la carte ou du produit ;\n'
+            '"nom_en": nom anglais (pour un produit scellé : extension + type, '
+            'ex "Prismatic Evolutions Booster Box") ;\n'
+            '"numero": numéro de la carte (ex "102", vide si inconnu) ;\n'
+            '"total": total du set (ex "128", vide si inconnu) ;\n'
+            '"raison": une phrase courte en français.'
+        )
+
+    @staticmethod
+    def _json(texte):
+        texte = (texte or "").replace("```json", "").replace("```", "").strip()
+        m = re.search(r"\{.*\}", texte, re.S)
+        res = json.loads(m.group(0) if m else texte)
+        return res[0] if isinstance(res, list) and res else res
+
+    def _groq(self, prompt):
+        for modele in list(self.groq):
+            try:
+                r = requests.post(f"{self.GROQ_URL}/chat/completions", timeout=(5, 40),
+                                  headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                                  json={"model": modele, "temperature": 0.1,
+                                        "response_format": {"type": "json_object"},
+                                        "messages": [{"role": "user", "content": prompt}]})
+                if r.status_code == 200:
+                    return self._json(r.json()["choices"][0]["message"]["content"])
+                if r.status_code in (400, 404, 429) and modele in self.groq:
+                    self.groq.remove(modele)   # indisponible ou quota atteint jusqu'au bilan
+                    print(f"   🪫 Groq {modele} : {r.status_code}, mis de côté")
+            except Exception as e:
+                print(f"   ⚠️ Groq {modele} : {str(e)[:60]}")
+        return None
+
+    def _gemini(self, prompt, photo):
+        if not self.client:
+            return None
+        contenu = [prompt]
+        if photo:
+            try:
+                r = requests.get(photo, timeout=TIMEOUT)
+                if r.status_code == 200 and len(r.content) < 4_000_000:
+                    contenu.append(genai_types.Part.from_bytes(
+                        data=r.content, mime_type=r.headers.get("Content-Type", "image/jpeg").split(";")[0]))
+            except Exception:
+                pass
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json", temperature=0.1,
+            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True))
+        for modele in list(self.gemini)[:4]:
+            try:
+                rep = self.client.models.generate_content(model=modele, contents=contenu, config=config)
+                return self._json(rep.text)
+            except Exception as e:
+                code = str(e)[:3]
+                if code in ("400", "404", "429", "401", "403") and modele in self.gemini:
+                    self.gemini.remove(modele)
+                    print(f"   🪫 Gemini {modele} : {code}, mis de côté")
+                elif modele in self.gemini:
+                    self.gemini.remove(modele)
+                    self.gemini.append(modele)   # surchargé : en fin de liste
+        return None
+
+    def identifier(self, a):
+        """Renvoie (résultat, ok)."""
+        if self.en_panne or not self.dispo:
+            return None, False
+        prompt = self.prompt(a)
+        ordre = ["groq", "gemini"] if IA_PRINCIPALE == "groq" else ["gemini", "groq"]
+        for tour in range(2):
+            for fournisseur in ordre:
+                try:
+                    res = self._groq(prompt) if fournisseur == "groq" else self._gemini(prompt, a.get("photo"))
+                except Exception:
+                    res = None
+                if isinstance(res, dict):
+                    time.sleep(1.5)   # respecte les limites par minute
+                    return res, True
+            if tour == 0 and self.dispo:
+                time.sleep(5)
+        self.en_panne = True
+        print("   💤 IA indisponible : les annonces à identifier attendront le prochain passage")
+        return None, False
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                   RENTABILITÉ & ANTI-ARNAQUE                     ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def rentabilite(prix, ref, livraison):
+    cout = prix + PROTECTION_FIXE + prix * PROTECTION_PCT + livraison
+    benef = ref * (1 - FRAIS_REVENTE_PCT) - cout
     roi = benef / cout * 100 if cout else 0
     return round(cout, 2), round(benef, 2), round(roi)
 
-def telecharger_image(url):
-    try:
-        r = requests.get(url, timeout=TIMEOUT)
-        if r.status_code == 200 and len(r.content) < 4_000_000:
-            return r.content, r.headers.get("Content-Type", "image/jpeg").split(";")[0]
-    except Exception:
-        pass
-    return None, None
-
-GEMINI_ECHECS = 0
-GEMINI_ECHECS_MAX = 3   # après 3 échecs complets, Gemini est ignoré jusqu'au run suivant
-
-def analyser(a):
-    """Essaie tous les modèles, plusieurs tours. Renvoie (resultat, ok).
-    ok=False seulement si TOUT a échoué -> l'annonce sera retentée au run suivant."""
-    if not (client and MODELES) and not GROQ_MODELES:
-        return None, False
-    prompt = PROMPT.format(date=time.strftime("%d/%m/%Y"), **a)
-    contenu = [prompt]
-    if ANALYSE_PHOTO and a.get("photo"):
-        data, mime = telecharger_image(a["photo"])
-        if data:
-            contenu.append(types.Part.from_bytes(data=data, mime_type=mime))
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        temperature=0.2,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
-
-    global GEMINI_ECHECS
-    gemini_ok = bool(client and MODELES) and GEMINI_ECHECS < GEMINI_ECHECS_MAX
-    for tour in range(TOURS_MAX):
-        if IA_PRINCIPALE == "groq" and GROQ_MODELES:
-            res = analyser_groq(prompt)
-            if isinstance(res, dict):
-                return res, True
-        essais = 0
-        for modele in (list(MODELES) if gemini_ok else []):
-            if essais >= GEMINI_ESSAIS_MAX:
-                break
-            essais += 1
-            try:
-                rep = client.models.generate_content(model=modele, contents=contenu, config=config)
-                texte = (rep.text or "").replace("```json", "").replace("```", "").strip()
-                res = json.loads(texte)
-                if isinstance(res, list):
-                    res = res[0] if res else {}
-                if modele != MODELES[0]:
-                    # On garde en premier le modèle qui marche
-                    MODELES.remove(modele)
-                    MODELES.insert(0, modele)
-                    print(f"   🔁 Bascule sur {modele}")
-                GEMINI_ECHECS = 0
-                return res, True
-            except json.JSONDecodeError:
-                print(f"   ⚠️ {modele} : réponse illisible, modèle suivant")
-            except Exception as e:
-                msg = str(e)
-                code = msg[:3]
-                if code in ("404", "400") and "API key" not in msg:
-                    print(f"   ❌ {modele} indisponible ({code}), retiré")
-                    if modele in MODELES and len(MODELES) > 1:
-                        MODELES.remove(modele)
-                elif code == "429":
-                    # Quota épuisé : inutile de le réessayer pendant ce run
-                    print(f"   🪫 {modele} : quota épuisé, retiré pour ce run")
-                    if modele in MODELES:
-                        MODELES.remove(modele)
-                    if not MODELES:
-                        print("   🪫 Plus aucun modèle Gemini disponible pour ce run")
-                        gemini_ok = False
-                        break
-                elif "API key" in msg or code in ("401", "403"):
-                    print(f"   ⛔ Clé Gemini refusée : {msg[:150]}")
-                    gemini_ok = False
-                    break
-                else:
-                    # Surcharge (503/504...) : on le passe en fin de liste
-                    print(f"   ⚠️ {modele} : {code} surcharge -> modèle suivant")
-                    if modele in MODELES and len(MODELES) > 1:
-                        MODELES.remove(modele)
-                        MODELES.append(modele)
-        if gemini_ok:
-            GEMINI_ECHECS += 1
-            if GEMINI_ECHECS >= GEMINI_ECHECS_MAX:
-                print("   🪫 Gemini échoue en boucle : désactivé pour ce run")
-                gemini_ok = False
-        if IA_PRINCIPALE != "groq" and GROQ_MODELES:
-            res = analyser_groq(prompt)
-            if isinstance(res, dict):
-                return res, True
-        if tour < TOURS_MAX - 1:
-            attente = PAUSE_TOUR[min(tour, len(PAUSE_TOUR) - 1)]
-            print(f"   ⏳ Tous les modèles ont échoué, nouvel essai dans {attente} s")
-            time.sleep(attente)
-    print("   ⚠️ Analyse impossible pour l'instant, annonce gardée pour le prochain run")
-    return None, False
-
-# ================= ANTI-ARNAQUE : VENDEUR + SCELLÉ =================
-_details = {}
-
-def _nombre(motif, texte, conv=float):
-    m = re.search(motif, texte)
-    try:
-        return conv(m.group(1)) if m else None
-    except ValueError:
-        return None
-
-def details_annonce(a):
-    """Description + avis du vendeur + pays (page de l'annonce, puis profil vendeur)."""
-    if a["id"] in _details:
-        return _details[a["id"]]
-    u = a.get("_user") or {}
-    d = {"description": "", "avis": u.get("feedback_count"), "rep": u.get("feedback_reputation"),
-         "pays": u.get("country_iso_code") or u.get("country_code")}
-    s = SESSION_VINTED or requests.Session()
-    try:
-        r = s.get(a["url"], timeout=TIMEOUT, headers={"Accept": "text/html,application/xhtml+xml"})
-        if r.status_code == 200:
-            t = r.text
-            m = (re.search(r'property="og:description"[^>]*content="([^"]*)"', t) or
-                 re.search(r'content="([^"]*)"[^>]*property="og:description"', t))
-            if m:
-                d["description"] = html.unescape(m.group(1))
-            if not d["description"]:
-                m = re.search(r'\\?"description\\?":\s*\\?"(.{0,1500}?)\\?"', t)
-                d["description"] = m.group(1) if m else ""
-            if d["avis"] is None:
-                d["avis"] = _nombre(r'\\?"feedback_count\\?":\s*(\d+)', t, int)
-            if d["rep"] is None:
-                d["rep"] = _nombre(r'\\?"feedback_reputation\\?":\s*([\d.]+)', t)
-            if not d["pays"]:
-                m = re.search(r'\\?"country_iso_code\\?":\s*\\?"([A-Za-z]{2})', t)
-                d["pays"] = m.group(1) if m else None
-        else:
-            print(f"   ⚠️ Page de l'annonce : {r.status_code}")
-    except Exception as e:
-        print(f"   ⚠️ Page de l'annonce indisponible : {str(e)[:60]}")
-    if d["avis"] is None and u.get("id"):
-        try:
-            r = s.get(f"{WWW}/api/v2/users/{u['id']}", timeout=TIMEOUT)
-            if r.status_code == 200:
-                uu = r.json().get("user", {})
-                d["avis"] = uu.get("feedback_count")
-                d["rep"] = uu.get("feedback_reputation")
-                d["pays"] = d["pays"] or uu.get("country_iso_code")
-        except Exception:
-            pass
-    if d["rep"] is not None:
-        d["note"] = round(d["rep"] * 5, 1) if d["rep"] <= 1 else round(d["rep"], 1)
-    else:
-        d["note"] = None
-    _details[a["id"]] = d
-    return d
-
-def verifier_annonce(a, scelle):
-    """Renvoie (ok, raison, details)."""
+def verifier(a, infos, exiger_rentable=True):
+    """Vérifie vendeur, pays, scellé et rentabilité réelle. Renvoie (ok, raison)."""
     d = details_annonce(a)
+    infos["details"] = d
     texte = f"{a['title']} {d['description']}"
-    if scelle and EXIGER_SCELLE:
-        sans_negation = re.sub(r"(jamais|non|pas) ouverte?s?", "", texte, flags=re.I)
-        if MOTS_OUVERT.search(sans_negation):
-            return False, "produit ouvert ou boîte vide", d
+    if infos["scelle"] and EXIGER_SCELLE:
+        if MOTS_OUVERT.search(re.sub(r"(jamais|non|pas) ouverte?s?", "", texte, flags=re.I)):
+            return False, "produit ouvert ou boîte vide"
         if MOTS_LOT.search(texte):
-            return False, "boîte remplie de cartes en vrac, pas un produit scellé", d
+            return False, "boîte remplie de vrac"
         if not MOTS_SCELLE_OK.search(texte):
-            return False, "« scellé » n'est indiqué ni dans le titre ni dans la description", d
+            return False, "« scellé » non indiqué"
     if d["avis"] is None or d["note"] is None:
-        if not VENDEUR_INCONNU_OK:
-            return False, "avis du vendeur introuvables", d
-    else:
-        if d["avis"] < VENDEUR_AVIS_MIN:
-            return False, f"vendeur avec seulement {d['avis']} avis (arnaque probable)", d
-        if d["note"] < VENDEUR_NOTE_MIN:
-            return False, f"vendeur noté {d['note']}/5 seulement", d
-    pays = (d["pays"] or "").upper()
-    if pays and pays not in PAYS_AUTORISES:
-        return False, f"vendeur situé dans un pays où on ne peut pas acheter ({pays})", d
-    if not pays and langue_annonce(a) != "fr":
-        return False, "pays du vendeur inconnu (annonce non française)", d
-    return True, "", d
+        return False, "avis du vendeur illisibles"
+    if d["avis"] < VENDEUR_AVIS_MIN:
+        return False, f"vendeur avec moins de {VENDEUR_AVIS_MIN} avis"
+    if d["note"] < VENDEUR_NOTE_MIN:
+        return False, f"vendeur noté sous {VENDEUR_NOTE_MIN:g}/5"
+    if d["pays"] and d["pays"] not in PAYS_AUTORISES:
+        return False, "pays où on ne peut pas acheter"
+    if not d["pays"] and infos["langue"] != "fr":
+        return False, "pays du vendeur inconnu"
+    # Port réel : plus cher si le vendeur n'est pas en France
+    if d["pays"] and d["pays"] != "FR":
+        cout, benef, roi = rentabilite(a["price"], infos["ref"], LIVRAISON_EUROPE)
+        infos.update(cout=cout, benef=benef, roi=roi, port="Europe")
+        if exiger_rentable and benef < BENEF_MIN:
+            return False, "plus rentable avec le port depuis l'étranger"
+    return True, ""
 
-def texte_vendeur(a, d):
-    morceaux = []
-    if a.get("vendeur"):
-        morceaux.append(f"👤 {html.escape(a['vendeur'])}")
-    if d and d.get("note") is not None:
-        morceaux.append(f"⭐ {str(d['note']).replace('.', ',')}/5 ({d['avis']} avis)")
-    if d and d.get("pays"):
-        morceaux.append(f"📍 {d['pays'].upper()}")
-    return " · ".join(morceaux)
 
-# ================= MESSAGE =================
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                            MESSAGES                              ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
 SEP = "━━━━━━━━━━━━━━━"
 
-def euros(x):
-    return f"{x:,.2f}".replace(",", " ").replace(".", ",").replace(",00", "") + " €"
-
 def jauge(decote):
-    """Barre visuelle de la décote : 10 cases = 100 %."""
     pleines = max(0, min(10, round(decote / 10)))
     couleur = "🟩" if decote >= DECOTE_MIN else ("🟨" if decote >= 10 else "🟥")
     return couleur * pleines + "⬜" * (10 - pleines)
@@ -1025,276 +973,302 @@ def niveau(decote, benef):
         return "🚀 GROS COUP"
     return "🔥 BON PLAN"
 
-def formater(a, titre, infos=None):
-    """Alerte bon plan."""
-    e = html.escape
-    drapeau = {"fr": "🇫🇷 ", "en": "🇬🇧 ", "ja": "🇯🇵 "}.get((infos or {}).get("langue"), "")
-    lignes = [f"<b>{titre}</b>", SEP, f"📦 {drapeau}<b>{e(a['title'][:90])}</b>"]
-    if infos:
-        lignes += [
-            f"💰 Vinted <b>{euros(a['price'])}</b>  ➜  📊 Cardmarket <b>{euros(infos['ref'])}</b>",
-            f"{jauge(infos['decote'])} <b>{'-' if infos['decote'] >= 0 else '+'}{abs(infos['decote'])} %</b>",
-            f"💵 <b>Bénéfice net : {'+' if infos['benef'] >= 0 else ''}{euros(infos['benef'])}</b>"
-            f"  (rentabilité {infos['roi']} %)",
-            f"🧾 Coût réel (protection + port) : {euros(infos['cout'])}",
-        ]
-        if infos.get("carte"):
-            lignes.append(f"🃏 {e(str(infos['carte'])[:80])}")
-        if infos.get("source", "").startswith("Estimation"):
-            lignes.append("🤖 Prix Cardmarket estimé par l'IA (produit non trouvé dans le guide)")
-    details = " · ".join(x for x in [
-        f"🏷️ {e(a['status'])}" if a.get("status") else "",
-        texte_vendeur(a, (infos or {}).get("details"))] if x)
-    if details:
-        lignes.append(details)
-    if (infos or {}).get("details"):
-        lignes.append("🛡️ Vendeur vérifié" + (" · Scellé confirmé ✅" if infos.get("scelle") else ""))
+def ligne_vendeur(a, d):
+    morceaux = []
+    if a.get("vendeur"):
+        morceaux.append(f"👤 {echapper(a['vendeur'])}")
+    if d and d.get("note") is not None:
+        morceaux.append(f"⭐ {str(d['note']).replace('.', ',')}/5 ({d['avis']} avis)")
+    if d and d.get("pays"):
+        morceaux.append(f"📍 {d['pays']}")
+    return " · ".join(morceaux)
+
+def boutons(a, infos):
+    return [[{"text": "🛒 Voir sur Vinted", "url": a["url"]},
+             {"text": "📊 Cardmarket", "url": lien_cardmarket(infos["recherche"])}]]
+
+def message_alerte(a, titre, infos):
+    e = echapper
+    signe_b = "+" if infos["benef"] >= 0 else ""
+    lignes = [
+        f"<b>{titre}</b>", SEP,
+        f"📦 {DRAPEAUX.get(infos['langue'], '')}<b>{e(a['title'][:90])}</b>",
+        f"💰 Vinted <b>{euros(a['price'])}</b>  ➜  📊 Cardmarket <b>{euros(infos['ref'])}</b>",
+        f"{jauge(infos['decote'])} <b>-{infos['decote']} %</b>",
+        f"💵 <b>Bénéfice net : {signe_b}{euros(infos['benef'])}</b>  (rentabilité {infos['roi']} %)",
+        f"🧾 Coût réel (protection + port {'Europe' if infos.get('port') == 'Europe' else 'France'})"
+        f" : {euros(infos['cout'])}",
+        f"🃏 {e(infos['carte'][:80])}",
+    ]
+    if infos.get("facteur", 1) < 1:
+        lignes.append(f"🩹 État « {e(a['status'])} » : prix Cardmarket ajusté "
+                      f"(-{round((1 - infos['facteur']) * 100)} %)")
+    elif a.get("status"):
+        lignes.append(f"🏷️ {e(a['status'])}")
+    vendeur = ligne_vendeur(a, infos.get("details"))
+    if vendeur:
+        lignes.append(vendeur)
+    lignes.append("🛡️ Vendeur vérifié" + (" · Scellé confirmé ✅" if infos["scelle"] else ""))
     lignes += [SEP, "⚡ Vérifie Cardmarket en 1 clic et fonce 👇"]
     return "\n".join(lignes)
 
-def formater_bilan(stats, top):
-    """Bilan d'un passage sans bon plan : stats + podium des meilleures affaires."""
-    e = html.escape
-    heure = datetime.now(ZoneInfo("Europe/Paris")).strftime("%H:%M")
-    periode = stats.get("periode") or f"PASSAGE DE {heure}"
-    etat = (f"✅ {stats['alertes']} bon(s) plan(s) envoyé(s)" if stats.get("alertes")
-            else "pas de bon plan")
-    lignes = [f"📋 <b>{periode}</b> · {etat}",
-              f"🆕 {stats['nouvelles']} nouvelles · 📊 {stats['comparees']} comparées"
-              f" · 🔎 {sum(stats.get('exclusions', {}).values())} filtrées"
-              f" · 🚫 {stats['ecartees']} écartées"
-              + (f" · ⏳ {stats['attente']} en attente" if stats['attente'] else "")
-              + (f"\n🛡️ {stats['refusees']} bloquée(s) par l'anti-arnaque" if stats.get('refusees') else "")]
-    excl = stats.get("exclusions") or {}
-    if excl:
-        noms = {"langue": "langue", "pays": "pays", "hors sujet": "hors sujet", "prix": "prix",
-                "non identifiable": "non identifiées"}
-        lignes.append("🔎 Filtres : " + " · ".join(f"{noms.get(k, k)} {v}" for k, v in
-                                                   sorted(excl.items(), key=lambda x: -x[1])))
-        total = stats["nouvelles"] or 1
-        if stats["comparees"] == 0 and stats["nouvelles"] >= 20:
-            pire = max(excl.items(), key=lambda x: x[1])
-            lignes.append(f"⚠️ <b>Anomalie</b> : aucune annonce comparée, le filtre « {pire[0]} » "
-                          f"en bloque {round(pire[1] * 100 / total)} %. Envoie les logs à ton assistant.")
+def message_bilan(st, top, titre_periode):
+    e = echapper
+    etat = f"✅ {st.alertes} bon(s) plan(s) envoyé(s)" if st.alertes else "pas de bon plan"
+    lignes = [f"📋 <b>{titre_periode}</b> · {etat}",
+              f"🆕 {st.nouvelles} nouvelles · 📊 {st.comparees} comparées à Cardmarket"
+              + (f" · ⏳ {st.attente} en attente" if st.attente else "")]
+    if st.filtres:
+        lignes.append("🔎 Filtrées : " + " · ".join(
+            f"{k} {v}" for k, v in sorted(st.filtres.items(), key=lambda x: -x[1])))
+    if st.refus:
+        lignes.append("🛡️ Bloquées : " + " · ".join(
+            f"{k} {v}" for k, v in sorted(st.refus.items(), key=lambda x: -x[1])))
+    # Alarmes automatiques
+    if st.recues == 0:
+        lignes.append("⚠️ <b>Anomalie</b> : Vinted n'a renvoyé aucune annonce sur la période.")
+    elif st.nouvelles >= 20 and st.comparees == 0 and st.filtres:
+        pire = max(st.filtres.items(), key=lambda x: x[1])
+        lignes.append(f"⚠️ <b>Anomalie</b> : aucune annonce comparée, « {pire[0]} » en bloque "
+                      f"{round(pire[1] * 100 / st.nouvelles)} %.")
+    if st.refus.get("avis du vendeur illisibles", 0) >= 3 and not st.alertes:
+        lignes.append("⚠️ <b>Anomalie</b> : les fiches vendeurs sont illisibles, "
+                      "les alertes sont bloquées par sécurité.")
     if top:
         lignes += [SEP, "🏆 <b>PODIUM</b>"]
         for medaille, (a, inf) in zip(["🥇", "🥈", "🥉"], top):
             signe = "-" if inf["decote"] >= 0 else "+"
             b = f"{'+' if inf['benef'] >= 0 else ''}{euros(inf['benef'])}"
-            drapeau = {"fr": "🇫🇷 ", "en": "🇬🇧 ", "ja": "🇯🇵 "}.get(inf.get("langue"), "")
-            lignes.append(f"{medaille} {drapeau}<b>{e(a['title'][:45])}</b>")
-            lignes.append(f"      {euros(a['price'])} au lieu de {euros(inf['ref'])} sur Cardmarket · "
+            lignes.append(f"{medaille} {DRAPEAUX.get(inf['langue'], '')}<b>{e(a['title'][:45])}</b>")
+            lignes.append(f"      {euros(a['price'])} au lieu de {euros(inf['ref'])} · "
                           f"{signe}{abs(inf['decote'])} % · {b}")
         a, inf = top[0]
         manque = []
-        if inf["decote"] < DECOTE_MIN:
-            manque.append(f"{DECOTE_MIN - inf['decote']} pts de décote")
+        seuil = ANGLAIS_DECOTE_MIN if inf["langue"] == "en" else DECOTE_MIN
+        if inf["decote"] < seuil:
+            manque.append(f"{seuil - inf['decote']} pts de décote")
         if inf["benef"] < BENEF_MIN:
             manque.append(f"{euros(BENEF_MIN - inf['benef'])} de bénéfice")
         if manque:
             lignes.append(f"📏 Il manque {' et '.join(manque)} au 🥇 pour une alerte")
     else:
-        lignes += [SEP, "😴 Aucune nouvelle annonce comparable sur cette période."]
+        lignes += [SEP, "😴 Aucune annonce comparable et fiable sur cette période."]
     lignes += [SEP, f"🎯 Tes seuils : -{DECOTE_MIN} % (🇬🇧 -{ANGLAIS_DECOTE_MIN} %) et "
                     f"+{euros(BENEF_MIN)} de bénéfice"]
     return "\n".join(lignes)
 
-# ================= CYCLE =================
-def cycle():
-    ids = charger_historique()
-    connus = set(ids)
-    premier_lancement = not ids
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                     HISTORIQUE & STATISTIQUES                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class Historique:
+    def __init__(self):
+        try:
+            with open(HISTORIQUE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.ids = [d["id"] if isinstance(d, dict) else d for d in data]
+        except Exception:
+            self.ids = []
+        self.set = set(self.ids)
+
+    def __contains__(self, i):
+        return i in self.set
+
+    def ajouter(self, i):
+        if i not in self.set:
+            self.ids.append(i)
+            self.set.add(i)
+
+    def sauver(self):
+        self.ids = self.ids[-HISTORIQUE_MAX:]
+        self.set = set(self.ids)
+        with open(HISTORIQUE_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.ids, f, indent=0)
+
+class Stats:
+    def __init__(self):
+        self.recues = self.nouvelles = self.comparees = self.attente = self.alertes = 0
+        self.filtres, self.refus = {}, {}
+        self.candidats = []
+
+    def fusion(self, o):
+        self.recues += o.recues
+        self.nouvelles += o.nouvelles
+        self.comparees += o.comparees
+        self.alertes += o.alertes
+        self.attente = o.attente
+        for k, v in o.filtres.items():
+            plus(self.filtres, k, v)
+        for k, v in o.refus.items():
+            plus(self.refus, k, v)
+        self.candidats += o.candidats
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                        TRAITEMENT D'ANNONCE                      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+TENTATIVES = {}   # annonces que l'IA n'a pas encore pu identifier
+
+def trouver_prix(a, langue, ia, st):
+    """Renvoie (prix Cardmarket, statut) — statut : 'ok', 'attente', ou une raison."""
+    titre = a["title"]
+    reverse = "reverse" in titre.lower()
+    num, total = extraire_numero(titre)
+
+    # 1) Carte avec numéro -> TCGdex, sans IA (pas pour le japonais : numérotation différente)
+    if num and langue != "ja":
+        cm = prix_carte(mots_du_titre(titre), num, total, reverse)
+        if cm:
+            print("   ⚡ Carte trouvée sur Cardmarket sans IA")
+            return cm, "ok"
+    # 2) Produit scellé -> guide officiel Cardmarket, sans IA
+    if MOTS_SCELLES.search(titre):
+        cm = prix_scelle(titre, langue)
+        if cm:
+            print(f"   ⚡ Produit trouvé sur Cardmarket sans IA : {cm['nom_en']}")
+            return cm, "ok"
+    # 3) Sinon l'IA identifie, puis on cherche le VRAI prix Cardmarket
+    if not (ia.groq_init or ia.gemini_init):      # aucune IA configurée
+        return None, "pas de prix Cardmarket"
+    res, ok = ia.identifier(a)
+    if not ok:
+        return None, "attente"
+    if res.get("pokemon") is not True:
+        return None, "pas du Pokémon (IA)"
+    if res.get("faux"):
+        return None, "contrefaçon (IA)"
+    typ = res.get("type")
+    if typ == "carte" and res.get("numero") and langue != "ja":
+        noms = [res.get("nom_fr"), res.get("nom_en")] + mots_du_titre(titre)
+        cm = prix_carte(noms, str(res.get("numero")), str(res.get("total") or total), reverse)
+        if cm:
+            return cm, "ok"
+    if typ in ("scelle", "lot"):
+        for requete in (res.get("nom_en"), res.get("nom_fr")):
+            cm = prix_scelle(requete or "", langue)
+            if cm:
+                return cm, "ok"
+    return None, "pas de prix Cardmarket"
+
+def traiter(a, ia, st, histo):
+    raison = raison_exclusion(a)
+    if raison:
+        plus(st.filtres, raison)
+        histo.ajouter(a["id"])
+        return
+
+    langue = langue_annonce(a)
+    print(f"🔍 {DRAPEAUX.get(langue, '')}{a['title'][:70]} — {euros(a['price'])}")
+    cm, statut = trouver_prix(a, langue, ia, st)
+    if statut == "attente":
+        plus(TENTATIVES, a["id"])
+        if TENTATIVES[a["id"]] >= 3:
+            plus(st.filtres, "non identifiable")
+            histo.ajouter(a["id"])
+        else:
+            st.attente += 1
+        return
+    histo.ajouter(a["id"])
+    if not cm:
+        plus(st.filtres, statut)
+        print(f"   ⏭️ {statut}")
+        return
+    if cm["scelle"] and MOTS_LOT.search(a["title"]):
+        plus(st.filtres, "boîte remplie de vrac")
+        print("   🚫 boîte remplie de cartes en vrac")
+        return
+
+    facteur = 1.0 if cm["scelle"] else facteur_etat(a.get("status"))
+    ref = round(cm["prix"] * facteur, 2)
+    decote = round((1 - a["price"] / ref) * 100) if ref > 0 else -999
+    cout, benef, roi = rentabilite(a["price"], ref, LIVRAISON_FRANCE)
+    carte = f"{cm['nom']} – {cm['set']}" if cm.get("set") else cm["nom"]
+    infos = {"ref": ref, "decote": decote, "cout": cout, "benef": benef, "roi": roi,
+             "carte": carte or "", "scelle": cm["scelle"], "langue": langue, "facteur": facteur,
+             "recherche": cm.get("nom_en") or cm["nom"]}
+    st.comparees += 1
+    ecart = f"-{decote} %" if decote >= 0 else f"+{-decote} % plus cher"
+    print(f"   📊 Cardmarket {euros(ref)} | {ecart} | bénéfice {euros(benef)}")
+    if decote < -100:
+        return
+    st.candidats.append((a, infos))
+
+    seuil = ANGLAIS_DECOTE_MIN if langue == "en" else DECOTE_MIN
+    wl = match_watchlist(a)
+    if decote >= seuil and benef >= BENEF_MIN:
+        titre = f"{niveau(decote, benef)} · -{decote} % SOUS CARDMARKET"
+    elif wl and benef >= BENEF_MIN and decote > 0:
+        titre = f"🎯 WATCHLIST « {wl[0]} » · -{decote} % SOUS CARDMARKET"
+    else:
+        return
+
+    ok, refus = verifier(a, infos)
+    if not ok:
+        plus(st.refus, refus)
+        st.candidats.remove((a, infos))
+        print(f"   🛡️ Alerte bloquée : {refus}")
+        return
+    if envoyer_telegram(message_alerte(a, titre, infos), a.get("photo"), boutons(a, infos)):
+        st.alertes += 1
+        print("   ✅ ALERTE ENVOYÉE")
+
+def cycle(ia, histo):
+    st = Stats()
     annonces = recuperer_annonces()
-    nouvelles = [a for a in annonces if a["id"] not in connus]
+    st.recues = len(annonces)
+    nouvelles = [a for a in annonces if a["id"] not in histo]
+    st.nouvelles = len(nouvelles)
     print(f"🆕 {len(nouvelles)} nouvelles annonces sur {len(annonces)}")
 
-    if premier_lancement and nouvelles:
-        # Évite d'envoyer 100 alertes au tout premier lancement
+    if not histo.ids and nouvelles:
         print("ℹ️ Premier lancement : annonces mémorisées sans alerte.")
-        sauvegarder_historique([a["id"] for a in nouvelles])
-        return {"nouvelles": len(nouvelles), "comparees": 0, "ecartees": 0,
-                "attente": 0, "alertes": 0, "candidats": [], "refusees": 0, "exclusions": {}}
+        for a in nouvelles:
+            histo.ajouter(a["id"])
+        histo.sauver()
+        return st
 
-    alertes = 0
-    a_reessayer = 0
-    ecartees = 0
-    exclusions = {}
-    refusees = 0
-    comparees = 0
-    candidats = []  # (annonce, infos) de toutes les annonces comparées
-    ia_en_panne = False
-    ia_dispo = bool(client or GROQ_MODELES)
+    ia.en_panne = False
     for a in nouvelles:
-        raison = raison_exclusion(a)
-        if raison:
-            exclusions[raison] = exclusions.get(raison, 0) + 1
-            ids.append(a["id"])
-            continue
+        try:
+            traiter(a, ia, st, histo)
+        except Exception as e:   # une annonce bizarre ne doit jamais bloquer les autres
+            print(f"   💥 Erreur sur « {a.get('title', '')[:40]} » : {str(e)[:80]}")
+            plus(st.filtres, "erreur")
+            histo.ajouter(a["id"])
+    histo.sauver()
+    if st.filtres:
+        print("🔎 Filtrées : " + " · ".join(f"{k} {v}" for k, v in st.filtres.items()))
+    if st.refus:
+        print("🛡️ Bloquées : " + " · ".join(f"{k} {v}" for k, v in st.refus.items()))
+    print(f"✨ Passage terminé : {st.alertes} alerte(s)")
+    return st
 
-        jeu = jeu_de(a)
-        wl = match_watchlist(a) if jeu == "pokemon" else None
-        print(f"🔍 [{'One Piece' if jeu == 'onepiece' else 'Pokémon'}] {a['title']} — {a['price']} €")
-        est_gradee = bool(GRADEE.search(a["title"]))
-        num_titre, total_titre = extraire_numero(a["title"])
-        res, ok, cm = {}, False, None
 
-        # 1) Carte Pokémon avec numéro -> prix Cardmarket direct, SANS IA
-        if jeu == "pokemon" and num_titre and not est_gradee:
-            cm = prix_cardmarket(mots_du_titre(a["title"]), num_titre, total_titre,
-                                 "reverse" in a["title"].lower())
-            if cm:
-                print("   ⚡ Trouvée sur Cardmarket sans IA")
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                        BILAN & SAUVEGARDE                        ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
-        # 1 bis) Produit scellé -> guide de prix Cardmarket, SANS IA
-        if not cm and not est_gradee and (MOTS_SCELLES.search(a["title"]) or jeu == "onepiece"):
-            cm = prix_scelle(a["title"], jeu)
-            if cm:
-                print(f"   ⚡ Trouvé dans le guide Cardmarket sans IA : {cm['nom']}")
-
-        # 2) Sinon : IA pour identifier (vrai produit ? faux ? lequel ?)
-        if not cm and ia_dispo and not ia_en_panne:
-            r, ok = analyser(a)
-            time.sleep(PAUSE_GEMINI)
-            res = r if isinstance(r, dict) else {}
-            if not ok:
-                ia_en_panne = True
-                print("   💤 IA indisponible : les annonces sans prix Cardmarket attendront")
-            elif res.get("faux") or res.get("suspect") or (jeu == "pokemon" and res.get("pokemon") is not True):
-                print(f"   🚫 écartée : {res.get('raison', '')}")
-                ecartees += 1
-                ids.append(a["id"])
-                continue
-            elif jeu == "pokemon" and res.get("numero") and not est_gradee \
-                    and res.get("type") not in ("gradee", "scelle"):
-                noms = [res.get("nom_fr"), res.get("nom_en")] + mots_du_titre(a["title"])
-                cm = prix_cardmarket(noms, str(res.get("numero")),
-                                     str(res.get("total") or total_titre or ""),
-                                     "reverse" in a["title"].lower())
-            if ok and not cm and res.get("type") in ("scelle", "lot", "autre", None):
-                cm = prix_scelle(res.get("nom_en") or "", jeu)
-                if cm:
-                    print(f"   📦 Trouvé dans le guide Cardmarket : {cm['nom']}")
-
-        numero = str(res.get("numero") or num_titre or "")
-        if cm:
-            ref, source = cm["prix"], "Prix Cardmarket"
-            nom_aff = cm.get("nom_fr") or cm["nom"]
-            carte = (f"{nom_aff} {numero} – {cm['set']}" if cm.get("set") else nom_aff).strip()
-        elif ok and jeu == "pokemon":
-            # Estimation IA acceptée seulement si c'est clairement du Pokémon
-            nom_ia = res.get("nom_fr") or ""
-            if not (POKEMON_INDICES.search(a["title"]) or
-                    (nom_ia and tcgdex_get("fr/cards", {"name": f"eq:{nom_ia}"}))):
-                print("   🚫 écartée : rien ne prouve que c'est du Pokémon")
-                ecartees += 1
-                ids.append(a["id"])
-                continue
-            try:
-                ref = float(res.get("prix_revente") or 0)
-            except (TypeError, ValueError):
-                ref = 0
-            source, carte = "Estimation IA", nom_ia
-        elif ok:
-            # One Piece sans prix Cardmarket : on ignore (prix Cardmarket obligatoire)
-            print("   ⏭️ One Piece : pas de prix Cardmarket, ignoré")
-            ids.append(a["id"])
-            continue
-        else:
-            # ni IA ni Cardmarket : on réessaie aux 2 passages suivants, puis on abandonne
-            TENTATIVES[a["id"]] = TENTATIVES.get(a["id"], 0) + 1
-            if TENTATIVES[a["id"]] >= 3:
-                exclusions["non identifiable"] = exclusions.get("non identifiable", 0) + 1
-                ids.append(a["id"])
-            else:
-                a_reessayer += 1
-            continue
-
-        ids.append(a["id"])
-        if ref <= 0:
-            continue
-
-        decote = round((1 - a["price"] / ref) * 100)
-        cout, benef, roi = calcul_rentabilite(a["price"], ref)
-        ecart = f"-{decote} %" if decote >= 0 else f"+{-decote} % plus cher"
-        print(f"   📊 {source} : {ref} € | {ecart} | bénéfice {benef} € | rentabilité {roi} %")
-
-        # Dernière barrière : il faut une PREUVE que c'est du Pokémon
-        preuve = (POKEMON_INDICES.search(a["title"])            # mot Pokémon dans le titre
-                  or (cm and not cm.get("scelle"))              # carte retrouvée sur TCGdex
-                  or (cm and cm.get("scelle") and jeu == "pokemon"))  # produit Pokémon Cardmarket
-        if not preuve:
-            print("   🚫 écartée : pas de preuve que c'est du Pokémon")
-            ecartees += 1
-            continue
-
-        est_scelle = bool((cm or {}).get("scelle")) or res.get("type") == "scelle"
-        if est_scelle and MOTS_LOT.search(a["title"]):
-            print("   🚫 écartée : boîte remplie de cartes en vrac, pas un produit scellé")
-            ecartees += 1
-            continue
-
-        comparees += 1
-        recherche = (cm or {}).get("nom") or res.get("nom_en") or res.get("nom_fr") or a["title"]
-        infos = {"source": source, "ref": ref, "carte": carte, "decote": decote, "cout": cout,
-                 "benef": benef, "roi": roi, "raison": res.get("raison"), "recherche": recherche}
-        infos["scelle"] = est_scelle
-        infos["langue"] = langue_annonce(a)
-        candidats.append((a, infos))
-        decote_min = ANGLAIS_DECOTE_MIN if infos["langue"] == "en" else DECOTE_MIN
-
-        if jeu == "onepiece":
-            alerte = decote >= OP_DECOTE_MIN and benef >= OP_BENEF_MIN
-            titre = f"🏴‍☠️ ONE PIECE EXTRÊME · -{decote} % SOUS CARDMARKET"
-        elif decote >= decote_min and benef >= BENEF_MIN:
-            alerte, titre = True, f"{niveau(decote, benef)} · -{decote} % SOUS CARDMARKET"
-        elif wl and a["price"] <= wl[1] and benef >= BENEF_MIN:
-            alerte, titre = True, f"🎯 WATCHLIST « {wl[0]} » · -{decote} % SOUS CARDMARKET"
-        else:
-            alerte = False
-
-        if alerte:
-            ok_verif, raison_refus, det = verifier_annonce(a, est_scelle)
-            infos["details"] = det
-            if not ok_verif:
-                print(f"   🛡️ Alerte bloquée : {raison_refus}")
-                refusees += 1
-                candidats.remove((a, infos))
-                alerte = False
-        if alerte and envoyer_telegram(formater(a, titre, infos), a["photo"], a["url"], recherche):
-            alertes += 1
-            print("   ✅ Alerte envoyée")
-
-    sauvegarder_historique(ids)
-    if a_reessayer:
-        print(f"🔁 {a_reessayer} annonce(s) seront réessayées au prochain run.")
-    print(f"✨ Cycle terminé : {alertes} alerte(s).")
-
-    return {"nouvelles": len(nouvelles), "comparees": comparees, "ecartees": ecartees,
-            "attente": a_reessayer, "alertes": alertes, "candidats": candidats,
-            "refusees": refusees, "exclusions": exclusions}
-
-def envoyer_bilan(stats):
+def envoyer_bilan(st, titre_periode):
     top = []
-    for a, inf in sorted(stats["candidats"],
-                         key=lambda c: (c[1].get("langue") != "en", c[1]["benef"], c[1]["decote"]),
-                         reverse=True)[:8]:
-        ok_verif, raison_refus, det = verifier_annonce(a, inf.get("scelle"))
-        if ok_verif:
-            inf["details"] = det
+    tries = sorted(st.candidats, key=lambda c: (c[1]["langue"] != "en", c[1]["benef"],
+                                                c[1]["decote"]), reverse=True)
+    for a, inf in tries[:8]:           # podium : uniquement des annonces fiables
+        ok, refus = verifier(a, inf, exiger_rentable=False)
+        if ok:
             top.append((a, inf))
-        else:
-            print(f"   🛡️ Podium : écartée ({raison_refus}) : {a['title'][:40]}")
-            stats["refusees"] = stats.get("refusees", 0) + 1
-        if len(top) == 3:
-            break
-    message = formater_bilan(stats, top)
+            if len(top) == 3:
+                break
+    message = message_bilan(st, top, titre_periode)
     if top:
         a1, i1 = top[0]
+        lignes_boutons = boutons(a1, i1)
         autres = [{"text": f"{m} Vinted", "url": a["url"]}
                   for m, (a, _) in zip(["🥈", "🥉"], top[1:])]
-        envoyer_telegram(message, a1.get("photo"), a1["url"], i1["recherche"],
-                         silencieux=RESUME_SILENCIEUX, lignes_boutons=[autres] if autres else None)
+        if autres:
+            lignes_boutons.append(autres)
+        envoyer_telegram(message, a1.get("photo"), lignes_boutons, silencieux=RESUME_SILENCIEUX)
     else:
         envoyer_telegram(message, silencieux=RESUME_SILENCIEUX)
     print("   📨 Bilan envoyé sur Telegram")
@@ -1303,78 +1277,73 @@ def sauvegarde_github():
     """Sur GitHub Actions : enregistre l'historique dans le dépôt (anti-doublons)."""
     if not os.getenv("GITHUB_ACTIONS"):
         return
-    import subprocess
-    cmds = [["git", "config", "user.name", "zuntytcg-bot"],
-            ["git", "config", "user.email", "bot@users.noreply.github.com"],
-            ["git", "add", HISTORIQUE_FILE],
-            ["git", "commit", "-m", "maj historique [skip ci]"],
-            ["git", "pull", "--rebase", "--autostash"],
-            ["git", "push"]]
-    for c in cmds:
-        subprocess.run(c, capture_output=True, timeout=60)
+    for c in (["git", "config", "user.name", "zuntytcg-bot"],
+              ["git", "config", "user.email", "bot@users.noreply.github.com"],
+              ["git", "add", HISTORIQUE_FILE],
+              ["git", "commit", "-m", "maj historique [skip ci]"],
+              ["git", "pull", "--rebase", "--autostash"],
+              ["git", "push"]):
+        try:
+            subprocess.run(c, capture_output=True, timeout=60)
+        except Exception:
+            pass
     print("   💾 Historique sauvegardé sur GitHub")
 
-TENTATIVES = {}  # id annonce -> nombre d'essais sans pouvoir l'identifier
 
-def fusionner(total, st):
-    for k, v in st.get("exclusions", {}).items():
-        total["exclusions"][k] = total["exclusions"].get(k, 0) + v
-    for k in ("nouvelles", "comparees", "ecartees", "alertes", "refusees"):
-        total[k] += st[k]
-    total["attente"] = st["attente"]
-    total["candidats"] += st["candidats"]
-
-def stats_vides():
-    return {"nouvelles": 0, "comparees": 0, "ecartees": 0, "attente": 0,
-            "alertes": 0, "candidats": [], "refusees": 0, "exclusions": {}}
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                              MAIN                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--loop", type=int, default=0,
-                        help="intervalle en secondes pour tourner en continu")
-    parser.add_argument("--duree", type=int, default=0,
-                        help="durée max en minutes (0 = sans fin)")
+    parser.add_argument("--loop", type=int, default=0, help="secondes entre deux passages")
+    parser.add_argument("--duree", type=int, default=0, help="durée max en minutes (0 = sans fin)")
     args = parser.parse_args()
 
     print("🚀 ZuntyTCG-Bot démarré")
+    ia = IA()
+    histo = Historique()
+
     if not args.loop:
-        st = cycle()
-        if RESUME_CHAQUE_RUN and st:
-            envoyer_bilan(st)
+        st = cycle(ia, histo)
+        if RESUME_CHAQUE_RUN:
+            envoyer_bilan(st, f"PASSAGE DE {heure()}")
         return
 
-    debut = time.time()
-    fin = debut + args.duree * 60 if args.duree else None
-    envoyer_telegram("🟢 <b>ZuntyTCG-Bot en ligne</b>\n"
-                     f"Surveillance de Vinted toutes les ~{args.loop // 60 or 1} min"
-                     + (f" pendant {args.duree // 60} h {args.duree % 60:02d}" if args.duree else "")
-                     + f".\nBilan toutes les {BILAN_TOUTES_LES_MIN} min, alertes en direct 🔥",
-                     silencieux=RESUME_SILENCIEUX)
-    periode, debut_periode, premier = stats_vides(), time.time(), True
+    fin = time.time() + args.duree * 60 if args.duree else None
+    envoyer_telegram(
+        "🟢 <b>ZuntyTCG-Bot en ligne</b>\n"
+        f"Vinted surveillé toutes les ~{max(1, args.loop // 60)} min"
+        + (f" pendant {args.duree // 60} h {args.duree % 60:02d}" if args.duree else "")
+        + f".\nAlertes en direct 🔥 · bilan toutes les {BILAN_TOUTES_LES_MIN} min 📋",
+        silencieux=RESUME_SILENCIEUX)
+    periode, debut_periode, premier = Stats(), time.time(), True
     while True:
         try:
-            st = cycle()
-            if st:
-                fusionner(periode, st)
+            periode.fusion(cycle(ia, histo))
         except Exception as e:
             print(f"💥 Erreur inattendue : {e}")
         maintenant = time.time()
-        if RESUME_CHAQUE_RUN and (premier or maintenant - debut_periode >= BILAN_TOUTES_LES_MIN * 60):
-            heure_debut = datetime.fromtimestamp(debut_periode, ZoneInfo("Europe/Paris")).strftime("%H:%M")
-            heure_fin = datetime.fromtimestamp(maintenant, ZoneInfo("Europe/Paris")).strftime("%H:%M")
-            periode["periode"] = f"BILAN {heure_debut} → {heure_fin}"
+        if premier or maintenant - debut_periode >= BILAN_TOUTES_LES_MIN * 60:
             try:
-                envoyer_bilan(periode)
+                if RESUME_CHAQUE_RUN:
+                    envoyer_bilan(periode, f"BILAN {heure(debut_periode)} → {heure(maintenant)}")
                 sauvegarde_github()
             except Exception as e:
                 print(f"💥 Erreur bilan : {e}")
-            periode, debut_periode, premier = stats_vides(), maintenant, False
+            ia.reinitialiser()      # quotas IA rechargés
+            _details.clear()
+            periode, debut_periode, premier = Stats(), maintenant, False
         attente = args.loop + random.randint(0, 20)
         if fin and maintenant + attente >= fin:
-            print("🏁 Durée maximale atteinte : fin de la session (relance automatique)")
+            print("🏁 Fin de session : la relance automatique prend le relais")
             break
         print(f"⏳ Prochain passage dans {attente} s\n")
         time.sleep(attente)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("👋 Arrêt demandé")
